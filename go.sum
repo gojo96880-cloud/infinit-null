@@ -74,3 +74,5 @@ gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405/go.mod h1:Co6ibVJAznAaIkqp8
 gopkg.in/yaml.v2 v2.4.0/go.mod h1:RDklbk79AGWmwuP8AcaJvxWYcZuqbmspQoAfhCdc04=
 gopkg.in/yaml.v3 v3.0.1 h1:fxVm/GzuluF3FS4JMPLx/dHscD8eNOuT3KlHVFnFiI=
 gopkg.in/yaml.v3 v3.0.1/go.mod h1:K4uyk+87mYWqQjQ5TcQ0Au3fm/v96SEZeGODXYSwLiI=
+github.com/gin-gonic/gin v1.9.1 h1:4idEAncQnU5cB7BeXkJoc4rXIddWALhJx8z2NwctDA=
+github.com/gin-gonic/gin v1.9.1/go.mod h1:hPrL7YrpYKXv5sFQyZsAvvf2fpWjLlwig+9ybtQSIw=
