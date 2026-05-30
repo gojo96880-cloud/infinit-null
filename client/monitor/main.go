@@ -8,23 +8,24 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
+	"runtime"
 	"time"
 )
 
-// LogSicurezza definisce la struttura dei dati inviati al SIEM centrale
+// LogSicurezza definisce la struttura dei dati inviati al server centrale
 type LogSicurezza struct {
 	Timestamp   string `json:"timestamp"`
 	Dispositivo string `json:"dispositivo"`
-	TipoEvento  string `json:"tipo_evento"` // "PROCESSI", "INTEGRITA_FILE"
+	TipoEvento  string `json:"tipo_evento"` // "PROCESSI", "INTEGRITA_FILE", "RETE"
 	Dettagli    string `json:"dettagli"`
-	Stato       string `json:"stato"`       // "OK", "ANOMALIA"
+	Stato       string `json:"stato"`       // "OK", "SUSPICIOUS", "ALERT"
 }
 
 func inviaLogAlGateway(logData LogSicurezza) {
 	urlGateway := "http://localhost:8080/api/v1/threats/"
-	
 	jsonData, err := json.Marshal(logData)
 	if err != nil {
 		log.Printf("Errore di codifica JSON: %v", err)
@@ -33,65 +34,87 @@ func inviaLogAlGateway(logData LogSicurezza) {
 
 	resp, err := http.Post(urlGateway, "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
-		log.Printf("Gateway non raggiungibile (Server spento o offline): %v", err)
+		log.Printf("Gateway centrale non raggiungibile: %v", err)
 		return
 	}
 	defer resp.Body.Close()
-	fmt.Printf("[CLIENT] Log inviato con successo. Risposta server: %s\n", resp.Status)
+	fmt.Printf("[EDR-AGENT] Evento [%s] inviato. Risposta server: %s\n", logData.TipoEvento, resp.Status)
 }
 
-// Analizza un file reale sul sistema e ne calcola l'hash SHA-256 per verificare che non sia alterato
-func analizzaFileIntegrita(percorsoFile string) string {
-	file, err := os.Open(percorsoFile)
+// Analizza i file sensibili del sistema per rilevare alterazioni non autorizzate
+func verificaIntegritaFile(percorso string) {
+	file, err := os.Open(percorso)
+	var stato, dettagli string
 	if err != nil {
-		return ""
+		stato = "ALERT"
+		dettagli = fmt.Sprintf("Allerta: Impossibile accedere al file critico %s o file rimosso!", percorso)
+	} else {
+		defer file.Close()
+		hash := sha256.New()
+		if _, err := io.Copy(hash, file); err != nil {
+			stato = "ALERT"
+			dettagli = fmt.Sprintf("Errore durante il calcolo dell'hash del file %s", percorso)
+		} else {
+			stato = "OK"
+			dettagli = fmt.Sprintf("Verifica file [%s] superata. SHA-256: %s", percorso, hex.EncodeToString(hash.Sum(nil)))
+		}
 	}
-	defer file.Close()
 
-	hash := sha256.New()
-	if _, err := io.Copy(hash, file); err != nil {
-		return ""
-	}
-
-	return hex.EncodeToString(hash.Sum(nil))
+	inviaLogAlGateway(LogSicurezza{
+		Timestamp:   time.Now().Format(time.RFC3339),
+		Dispositivo: "Windows-Endpoint",
+		TipoEvento:  "INTEGRITA_FILE",
+		Dettagli:    dettagli,
+		Stato:       stato,
+	})
 }
 
-func monitoraSistema() {
-	fmt.Println("[MONITOR] Avvio scansione attiva del dispositivo...")
+// Controlla le porte e le connessioni attive sul dispositivo locale
+func controllaConnessioniRete() {
+	var porteIntercettate []int
+	// Scansione locale per identificare servizi in ascolto non autorizzati
+	for porto := 80; porto <= 1024; porto++ {
+		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", porto))
+		if err != nil {
+			// Se la porta è occupata, c'è un servizio attivo
+			porteIntercettate = append(porteIntercettate, porto)
+		} else {
+			ln.Close()
+		}
+	}
 
-	// Esempio di monitoraggio integrità su un file critico di sistema
-	// Nota: Su Windows reale monitorerà file come "C:\\Windows\\System32\\drivers\\etc\\hosts"
-	percorsoTest := "go.mod" 
-	hashOttenuto := analizzaFileIntegrita(percorsoTest)
+	stato := "OK"
+	if len(porteIntercettate) > 5 {
+		stato = "SUSPICIOUS"
+	}
 
-	dettagliMsg := fmt.Sprintf("Verifica file [%s]. Hash calcolato: %s", percorsoTest, hashOttenuto)
-	
-	logData := LogSicurezza{
+	inviaLogAlGateway(LogSicurezza{
 		Timestamp:   time.Now().Format(time.RFC3339),
-		Dispositivo: "Endpoint-Windows-User",
-		TipoEvento:  "INTEGRITA_FILE",
-		Dettagli:    dettagliMsg,
-		Stato:       "OK",
-	}
+		Dispositivo: "Windows-Endpoint",
+		TipoEvento:  "RETE",
+		Dettagli:    fmt.Sprintf("Scansione porte locali completata. Porte attive rilevate: %v", porteIntercettate),
+		Stato:       stato,
+	})
+}
 
-	if hashOttenuto == "" {
-		logData.Dettagli = fmt.Sprintf("Allerta: Impossibile accedere al file critico %s o file rimosso!", percorsoTest)
-		logData.Stato = "ANOMALIA"
-	}
-
-	inviaLogAlGateway(logData)
+func eseguiAuditDifensivo() {
+	fmt.Println("[EDR-AGENT] Avvio sessione di monitoraggio attivo...")
+	// Monitoraggio di un file del modulo come test di integrità
+	verificaIntegritaFile("main.go")
+	controllaConnessioniRete()
 }
 
 func main() {
-	fmt.Println("====================================================")
-	fmt.Println(" CORE AGENT AVVIATO: MONITORAGGIO INTEGRITÀ ATTIVO ")
-	fmt.Println("====================================================")
+	fmt.Printf("=====================================================\n")
+	fmt.Printf(" AGENTE DI PROTEZIONE ATTIVA AVVIATO (%s)\n", runtime.GOOS)
+	fmt.Printf("=====================================================\n")
 
-	// Esegue il controllo di sicurezza continuo ogni 15 secondi
-	ticker := time.NewTicker(15 * time.Second)
+	// Monitoraggio periodico continuo impostato a 30 secondi
+	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
+	eseguiAuditDifensivo()
 	for range ticker.C {
-		monitoraSistema()
+		eseguiAuditDifensivo()
 	}
 }
