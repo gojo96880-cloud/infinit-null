@@ -26,7 +26,6 @@ type ThreatLogEntry struct {
 	Timestamp string `json:"timestamp"`
 }
 
-// STRUTTURA PER IL RATE LIMITER (Rilevamento DDoS / Brute-Force)
 type IPRateLimiter struct {
 	mu       sync.Mutex
 	requests map[string][]time.Time
@@ -36,11 +35,9 @@ var Limiter = IPRateLimiter{
 	requests: make(map[string][]time.Time),
 }
 
-// Middleware di controllo: Massimo 5 richieste in una finestra di 5 secondi
 func rateLimitMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ip := r.RemoteAddr
-		// Pulisce la porta dal formato dell'IP se presente
 		if idx := strings.LastIndex(ip, ":"); idx != -1 {
 			ip = ip[:idx]
 		}
@@ -48,7 +45,6 @@ func rateLimitMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		Limiter.mu.Lock()
 		now := time.Now()
 		
-		// Rimuove i vecchi timestamp fuori dalla finestra dei 5 secondi
 		var validRequests []time.Time
 		for _, t := range Limiter.requests[ip] {
 			if now.Sub(t) < 5*time.Second {
@@ -56,7 +52,6 @@ func rateLimitMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			}
 		}
 
-		// Verifica se ha superato il limite di 5 richieste
 		if len(validRequests) >= 5 {
 			Limiter.mu.Unlock()
 			log.Printf("[🚨 ALLERTA DDoS] Rilevato traffico anomalo o Brute-Force dall'IP: %s. Richiesta bloccata.\n", ip)
@@ -64,7 +59,6 @@ func rateLimitMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		// Aggiunge la richiesta attuale e aggiorna la mappa
 		validRequests = append(validRequests, now)
 		Limiter.requests[ip] = validRequests
 		Limiter.mu.Unlock()
@@ -88,15 +82,41 @@ func main() {
 		log.Fatal("Errore creazione tabella log minacce:", err)
 	}
 
-	// Applichiamo il filtro protettivo (Middleware) a tutte le rotte pubbliche e sensibili
+	// AVVIO DELLA ROUTINE DI AUTO-PULIZIA (Database TTL)
+	// Gira in background in una goroutine separata
+	go startDatabaseTTLWorker()
+
 	http.HandleFunc("/register", rateLimitMiddleware(registerHandler))
 	http.HandleFunc("/login", rateLimitMiddleware(loginHandler))
 	http.HandleFunc("/protected", rateLimitMiddleware(protectedHandler))
 	http.HandleFunc("/admin/dashboard", rateLimitMiddleware(adminDashboardHandler))
 
-	log.Println("🚀 API Gateway in ascolto sulla porta :8080 con protezione DDoS attiva...")
+	log.Println("🚀 API Gateway in ascolto sulla porta :8080 con protezione DDoS e Auto-Pulizia attive...")
 	if err := http.ListenAndServe(":8080", nil); err != nil {
 		log.Fatal(err)
+	}
+}
+
+// Funzione Worker: Esegue una pulizia ogni 24 ore
+func startDatabaseTTLWorker() {
+	for {
+		log.Println("[🧹 SMANEGGIAMENTO] Avvio del controllo di manutenzione del Database...")
+		
+		// Elimina i record dove il timestamp è precedente a 30 giorni fa
+		result, err := DB.Exec("DELETE FROM threat_logs WHERE timestamp < datetime('now', '-30 days')")
+		if err != nil {
+			log.Println("[❌] Errore durante l'auto-pulizia dei log:", err)
+		} else {
+			rowsAffected, _ := result.RowsAffected()
+			if rowsAffected > 0 {
+				log.Printf("[🧹 PULIZIA COMPLETATA] Rimossi con successo %d log obsoleti più vecchi di 30 giorni.\n", rowsAffected)
+			} else {
+				log.Println("[📋 MANUTENZIONE] Nessun log obsoleto trovato. Database ottimizzato.")
+			}
+		}
+
+		// Attende 24 ore prima del prossimo ciclo di pulizia
+		time.Sleep(24 * time.Hour)
 	}
 }
 
