@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
@@ -25,9 +26,8 @@ const hexBotToken = "494c5f54554f5f4a57545f544f4b454e5f515549"
 const hexQuarantineDir = "2f776f726b7370616365732f696e66696e69742d6e756c6c2f71756172616e74696e65" 
 const hexWebhookURL = "68747470733a2f2f6874747062696e2e6f72672f706f7374"               
 
-// CHIAVE OFFUSCATA CON XOR (I byte reali sono mascherati per l'anti-dumping della memoria)
 var obfuscatedCryptoKey = []byte{0x2b, 0x31, 0x2a, 0x3d, 0x35, 0x3b, 0x2b, 0x3d, 0x3d, 0x23, 0x23, 0x23, 0x23, 0x23, 0x23, 0x23, 0x23, 0x23, 0x23, 0x23, 0x23, 0x23, 0x23, 0x23, 0x23, 0x23, 0x23, 0x23, 0x23, 0x23, 0x32, 0x3d}
-const xorMask byte = 0x4A // Maschera XOR per la decodifica al volo
+const xorMask byte = 0x4A 
 
 var knownUSBDevicesCount = 0 
 
@@ -43,7 +43,6 @@ func decodeString(hexStr string) string {
 	return string(bytes)
 }
 
-// Funzione XOR dinamica: estrae la vera chiave AES a 32 byte in memoria solo quando serve
 func getDecryptedKey() []byte {
 	realKey := make([]byte, len(obfuscatedCryptoKey))
 	for i := 0; i < len(obfuscatedCryptoKey); i++ {
@@ -53,7 +52,7 @@ func getDecryptedKey() []byte {
 }
 
 func main() {
-	log.Println("⚡ Agente di Protezione con XOR Key Obfuscation avviato...")
+	log.Println("⚡ Agente di Protezione Integrale con Anti-Time Tampering avviato...")
 	
 	err := os.MkdirAll(decodeString(hexQuarantineDir), 0755)
 	if err != nil {
@@ -70,8 +69,43 @@ func main() {
 		checkUSBHardwareInjection() 
 		checkNetworkIntrusions() 
 		checkHiddenRootkitProcesses() 
+		checkTimeTampering() // Verifica se l'orologio di sistema locale è stato manomesso
 		cleanOldQuarantineFiles() 
 		time.Sleep(10 * time.Second)
+	}
+}
+
+// DETECTOR TEMPORALE: Rileva sfasamenti artificiali dell'orologio di sistema
+func checkTimeTampering() {
+	client := &http.Client{Timeout: 3 * time.Second}
+	// Chiamata di controllo a un server orario attendibile
+	resp, err := client.Get("http://worldtimeapi.org")
+	if err != nil {
+		return // Salta il controllo se manca internet temporaneamente
+	}
+	defer resp.Body.Close()
+
+	var data map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return
+	}
+
+	// Estrae il timestamp Unix reale dal server cloud
+	unixtimeStr := fmt.Sprintf("%v", data["unixtime"])
+	realUnixTime, err := strconv.ParseInt(strings.Split(unixtimeStr, ".")[0], 10, 64)
+	if err != nil {
+		return
+	}
+
+	localUnixTime := time.Now().Unix()
+	// Calcola la differenza in minuti (valore assoluto)
+	diffMinutes := math.Abs(float64(localUnixTime-realUnixTime)) / 60.0
+
+	// Se la discrepanza supera i 5 minuti, è in corso una manomissione
+	if diffMinutes > 5.0 {
+		log.Printf("[🚨 TIME TAMPERING] Rilevato sfasamento critico dell'orologio di sistema! Differenza: %.1f minuti\n", diffMinutes)
+		sendWebhookAlert("🚨 MANOMISSIONE ORA DI SISTEMA", fmt.Sprintf("L'orologio locale differisce di %.1f minuti dal tempo UTC reale. Possibile attacco di elusione scadenze.", diffMinutes))
+		reportThreatToGateway(fmt.Sprintf("Time Tampering Detected: Clock skew of %.1f minutes", diffMinutes))
 	}
 }
 
@@ -81,21 +115,16 @@ func encryptAndIsolateFile(filePath string) {
 		_ = os.Remove(filePath)
 		return
 	}
-
-	// Recupera temporaneamente la chiave reale tramite operazione XOR
 	realAESKey := getDecryptedKey()
 	block, err := aes.NewCipher(realAESKey)
 	if err != nil {
 		return
 	}
-
-	// Sovrascrive immediatamente la memoria temporanea della chiave per sicurezza forense
 	defer func() {
 		for i := range realAESKey {
 			realAESKey[i] = 0
 		}
 	}()
-
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
 		return
@@ -104,14 +133,11 @@ func encryptAndIsolateFile(filePath string) {
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
 		return
 	}
-
 	ciphertext := gcm.Seal(nonce, nonce, plaintext, nil)
-
 	fileName := filepath.Base(filePath)
 	destination := filepath.Join(decodeString(hexQuarantineDir), fileName+".locked")
 	_ = os.WriteFile(destination, ciphertext, 0644)
 	_ = os.Remove(filePath)
-	log.Printf("[🔒 CRYPTO-QUARANTENA] File cifrato con chiave protetta da XOR e isolato.\n")
 }
 
 func checkHiddenRootkitProcesses() {
@@ -141,7 +167,7 @@ func checkHiddenRootkitProcesses() {
 	for _, name := range dirs {
 		if _, err := strconv.Atoi(name); err == nil {
 			if !visiblePIDs[name] {
-				log.Printf("[🚨 ROOTKIT DETECTED] Rilevato processo nascosto! PID: %s\n", name)
+				log.Printf("[🚨 ROOTKIT DETECTED] Processo nascosto! PID: %s\n", name)
 				sendWebhookAlert("🚨 ATTACCO ROOTKIT CRITICO", fmt.Sprintf("Processo maligno nascosto rilevato. PID: %s.", name))
 				reportThreatToGateway("Rootkit Intrusion: Hidden Process PID " + name)
 			}
