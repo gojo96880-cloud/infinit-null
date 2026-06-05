@@ -10,22 +10,28 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
 
 const gatewayURL = "http://localhost:8080/protected"
 const botToken = "IL_TUO_JWT_TOKEN_QUI"
+const quarantineDir = "/workspaces/infinit-null/quarantine" // Percorso della cartella di quarantena
 
-// Mappa per memorizzare gli hash dei file importanti e verificare se cambiano
 var fileRegistry = map[string]string{
-	"/workspaces/infinit-null/go.work": "", // Monitora il workspace di Go
+	"/workspaces/infinit-null/go.work": "", 
 }
 
 func main() {
-	log.Println("Encoding ⚡ Agente di Protezione Avanzato Client avviato...")
+	log.Println("⚡ Agente di Protezione Avanzato con Quarantena avviato...")
 	
-	// Inizializza gli hash dei file al primo avvio
+	// Crea la cartella di quarantena se non esiste sul dispositivo
+	err := os.MkdirAll(quarantineDir, 0755)
+	if err != nil {
+		log.Fatalf("[❌] Impossibile creare la cartella di quarantena: %v", err)
+	}
+
 	initializeFileHashes()
 
 	for {
@@ -36,7 +42,6 @@ func main() {
 	}
 }
 
-// Calcola l'hash iniziale dei file per fare il confronto in seguito
 func initializeFileHashes() {
 	for filePath := range fileRegistry {
 		hash, err := calculateFileHash(filePath)
@@ -47,7 +52,6 @@ func initializeFileHashes() {
 	}
 }
 
-// Calcola l'hash SHA-256 di un file
 func calculateFileHash(filePath string) (string, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -62,22 +66,39 @@ func calculateFileHash(filePath string) (string, error) {
 	return hex.EncodeToString(hasher.Sum(nil)), nil
 }
 
-// Controlla se i file registrati sono stati modificati abusivamente
 func checkFileIntegrity() {
 	for filePath, oldHash := range fileRegistry {
 		currentHash, err := calculateFileHash(filePath)
 		if err != nil {
-			log.Printf("[⚠️ WARNING] Impossibile accedere al file tracciato: %s\n", filePath)
 			continue
 		}
 
 		if oldHash != "" && currentHash != oldHash {
 			log.Printf("[🚨 INTEGRITÀ VIOLATA] Il file %s è stato modificato abusivamente!\n", filePath)
-			reportThreatToGateway("File Tampering: " + filePath)
-			// Aggiorna l'hash per evitare allarmi infiniti sullo stesso evento
+			
+			// ATTIVAZIONE QUARANTENA: Isola immediatamente il file compromesso
+			isolateFile(filePath)
+
+			reportThreatToGateway("File Tampering & Isolate: " + filePath)
 			fileRegistry[filePath] = currentHash
 		}
 	}
+}
+
+// Funzione di isolamento balistico del file infetto
+func isolateFile(filePath string) {
+	fileName := filepath.Base(filePath)
+	destination := filepath.Join(quarantineDir, fileName+"_compromised_"+time.Now().Format("20060102_150405"))
+
+	// Sposta il file nella directory di quarantena per bloccarne l'esecuzione
+	err := os.Rename(filePath, destination)
+	if err != nil {
+		log.Printf("[❌] Spostamento in quarantena fallito per %s: %v. Tento la rimozione sicura...\n", fileName, err)
+		_ = os.Remove(filePath) // Se non riesce a spostarlo, lo elimina per sicurezza
+		return
+	}
+
+	log.Printf("[🔒 QUARANTENA] File pericoloso NEUTRALIZZATO e spostato in: %s\n", destination)
 }
 
 func checkSuspiciousProcesses() {
@@ -103,7 +124,7 @@ func checkSuspiciousProcesses() {
 func reportThreatToGateway(threatType string) {
 	data := map[string]string{
 		"event":  threatType,
-		"status": "Blocked",
+		"status": "Blocked & Isolated",
 	}
 	jsonData, _ := json.Marshal(data)
 
