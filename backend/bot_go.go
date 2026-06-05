@@ -19,12 +19,11 @@ import (
 	"time"
 )
 
-const gatewayURL = "http://localhost:8080/protected"
-const botToken = "IL_TUO_JWT_TOKEN_QUI"
-const quarantineDir = "/workspaces/infinit-null/quarantine"
-
-// URL DEL WEBHOOK (Puoi sostituirlo con un vero URL webhook di Discord o Telegram) [1]
-const securityWebhookURL = "https://httpbin.org" 
+// STRINGHE OFFUSCATE IN ESADECIMALE (Nasconde URL, Token e percorsi ai software di Reverse Engineering)
+const hexGatewayURL = "687474703a2f2f6c6f63616c686f73743a383038302f70726f746563746564" // http://localhost:8080/protected
+const hexBotToken = "494c5f54554f5f4a57545f544f4b454e5f515549"                       // IL_TUO_JWT_TOKEN_QUI
+const hexQuarantineDir = "2f776f726b7370616365732f696e66696e69742d6e756c6c2f71756172616e74696e65" // /workspaces/infinit-null/quarantine
+const hexWebhookURL = "68747470733a2f2f6874747062696e2e6f72672f706f7374"               // https://httpbin.org
 
 var cryptoKey = []byte("cyber-secure-key-aes-256-bit-pt")
 
@@ -32,10 +31,19 @@ var fileRegistry = map[string]string{
 	"/workspaces/infinit-null/go.work": "", 
 }
 
+// Funzione di decodifica al volo (Risolve l'offuscamento in memoria solo quando necessario)
+func decodeString(hexStr string) string {
+	bytes, err := hex.DecodeString(hexStr)
+	if err != nil {
+		return ""
+	}
+	return string(bytes)
+}
+
 func main() {
-	log.Println("⚡ Agente di Protezione con Notifiche Webhook avviato...")
+	log.Println("⚡ Agente di Protezione Corazzato e Offuscato avviato...")
 	
-	err := os.MkdirAll(quarantineDir, 0755)
+	err := os.MkdirAll(decodeString(hexQuarantineDir), 0755)
 	if err != nil {
 		log.Fatalf("[❌] Impossibile creare la cartella di quarantena: %v", err)
 	}
@@ -86,8 +94,7 @@ func checkFileIntegrity() {
 			
 			encryptAndIsolateFile(filePath)
 
-			// Invia l'allarme istantaneo al Webhook dell'amministratore [1]
-			sendWebhookAlert("🚨 ALLERTA MANOMISSIONE FILE", fmt.Sprintf("Il file importante %s è stato modificato abusivamente ed è stato spostato in quarantena cifrata AES-256.", filePath))
+			sendWebhookAlert("🚨 ALLERTA MANOMISSIONE FILE", fmt.Sprintf("Il file importante %s è stato modificato ed è stato spostato in quarantena cifrata AES-256.", filePath))
 
 			reportThreatToGateway("File Tampering & Encrypted Quarantine: " + filePath)
 			fileRegistry[filePath] = currentHash
@@ -119,26 +126,23 @@ func encryptAndIsolateFile(filePath string) {
 	ciphertext := gcm.Seal(nonce, nonce, plaintext, nil)
 
 	fileName := filepath.Base(filePath)
-	destination := filepath.Join(quarantineDir, fileName+".locked")
+	destination := filepath.Join(decodeString(hexQuarantineDir), fileName+".locked")
 	
 	_ = os.WriteFile(destination, ciphertext, 0644)
 	_ = os.Remove(filePath)
 	log.Printf("[🔒 CRYPTO-QUARANTENA] Il file %s è stato cifrato e neutralizzato.\n", fileName)
 }
 
-// FUNZIONE DI INVIO WEBHOOK PER INCIDENTI DI SICUREZZA [1]
 func sendWebhookAlert(title, message string) {
 	payload := map[string]interface{}{
-		"username":   "Security Bot Agent",
-		"avatar_url": "",
-		"content":    fmt.Sprintf("**%s**\n📅 *Data:* %s\n💬 *Dettagli:* %s", title, time.Now().Format("2006-01-02 15:04:05"), message),
+		"username": "Security Bot Agent",
+		"content":  fmt.Sprintf("**%s**\n📅 *Data:* %s\n💬 *Dettagli:* %s", title, time.Now().Format("2006-01-02 15:04:05"), message),
 	}
 	
 	jsonData, _ := json.Marshal(payload)
 	
-	resp, err := http.Post(securityWebhookURL, "application/json", bytes.NewBuffer(jsonData))
+	resp, err := http.Post(decodeString(hexWebhookURL), "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
-		log.Printf("[⚠️ Webhook] Impossibile inviare l'allerta esterna: %v\n", err)
 		return
 	}
 	defer resp.Body.Close()
@@ -161,8 +165,7 @@ func checkSuspiciousProcesses() {
 		if strings.Contains(strings.ToLower(outputStr), tool) {
 			log.Printf("[🚨 MINACCIA RILEVATA] Trovato processo sospetto attivo: %s!\n", tool)
 			
-			// Invia l'allarme istantaneo al Webhook per processo malevolo [1]
-			sendWebhookAlert("💀 PROCESSO MALIGNO RILEVATO", fmt.Sprintf("È stato trovato un tool di hacking attivo sul dispositivo: %s. Il sistema ha bloccato la minaccia.", tool))
+			sendWebhookAlert("💀 PROCESSO MALIGNO RILEVATO", fmt.Sprintf("È stato trovato un tool di hacking attivo sul dispositivo: %s.", tool))
 
 			reportThreatToGateway("Suspicious Process: " + tool)
 		}
@@ -176,9 +179,9 @@ func reportThreatToGateway(threatType string) {
 	}
 	jsonData, _ := json.Marshal(data)
 
-	req, _ := http.NewRequest("POST", gatewayURL, bytes.NewBuffer(jsonData))
+	req, _ := http.NewRequest("POST", decodeString(hexGatewayURL), bytes.NewBuffer(jsonData))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+botToken)
+	req.Header.Set("Authorization", "Bearer "+decodeString(hexBotToken))
 
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Do(req)
