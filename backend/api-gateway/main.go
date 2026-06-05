@@ -1,10 +1,15 @@
 package main
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -42,6 +47,9 @@ var Limiter = IPRateLimiter{
 	requests:       make(map[string][]time.Time),
 	violationCount: make(map[string]int),
 }
+
+// Chiave di cifratura simmetrica per i file di backup del DB (AES-256)
+var backupCryptoKey = []byte("key-secure-database-backup-256b")
 
 func rateLimitMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -89,7 +97,6 @@ func rateLimitMiddleware(next http.HandlerFunc) http.HandlerFunc {
 func main() {
 	InitDB()
 
-	// 1. Tabella dei Log Minacce
 	_, err := DB.Exec(`
 		CREATE TABLE IF NOT EXISTS threat_logs (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -102,7 +109,6 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// 2. Tabella Firewall per IP Bannati
 	_, err = DB.Exec(`
 		CREATE TABLE IF NOT EXISTS banned_ips (
 			ip TEXT PRIMARY KEY,
@@ -114,14 +120,11 @@ func main() {
 	}
 
 	_, _ = DB.Exec("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'viewer';")
-
-	// ⚡ CREAZIONE DEGLI INDICI SQL PER LE PRESTAZIONI (Ottimizzazione Query di Ricerca)
-	// Indice per cercare all'istante i log in base alla data (usato dal Worker di pulizia e dai Report)
 	_, _ = DB.Exec("CREATE INDEX IF NOT EXISTS idx_threat_logs_timestamp ON threat_logs(timestamp);")
-	// Indice per velocizzare l'ordinamento decrescente dei log nella Dashboard Amministrativa
 	_, _ = DB.Exec("CREATE INDEX IF NOT EXISTS idx_threat_logs_id_desc ON threat_logs(id DESC);")
 
-	go startDatabaseTTLWorker()
+	// AVVIO DELLA ROUTINE DI MANUTENZIONE E BACKUP CIFRATO
+	go startDatabaseManutentionWorker()
 
 	http.HandleFunc("/register", rateLimitMiddleware(registerHandler))
 	http.HandleFunc("/login", rateLimitMiddleware(loginHandler))
@@ -130,17 +133,67 @@ func main() {
 	http.HandleFunc("/admin/unban", rateLimitMiddleware(adminUnbanHandler)) 
 	http.HandleFunc("/admin/report", rateLimitMiddleware(adminReportHandler)) 
 
-	log.Println("🚀 API Gateway attivo e ottimizzato con Indici SQL di ricerca rapida...")
+	log.Println("🚀 API Gateway attivo con modulo di Backup Automatico Cifrato...")
 	if err := http.ListenAndServe(":8080", nil); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func startDatabaseTTLWorker() {
+// Worker unico per la manutenzione e il backup sicuro dei dati
+func startDatabaseManutentionWorker() {
+	backupDir := "/workspaces/infinit-null/backups"
+	_ = os.MkdirAll(backupDir, 0755)
+
 	for {
+		log.Println("[🧹 MANUTENZIONE] Avvio del ciclo periodico di pulizia log...")
 		_, _ = DB.Exec("DELETE FROM threat_logs WHERE timestamp < datetime('now', '-30 days')")
+
+		log.Println("[💾 BACKUP] Avvio della procedura di backup cifrato AES-256...")
+		err := encryptAndBackupDatabase(backupDir)
+		if err != nil {
+			log.Println("[❌] Errore critico durante la creazione del backup del Database:", err)
+		}
+
+		// Attende 24 ore prima del prossimo ciclo completo
 		time.Sleep(24 * time.Hour)
 	}
+}
+
+// Legge il file SQLite attuale, lo cifra al volo e lo salva in un archivio marcato
+func encryptAndBackupDatabase(backupDir string) error {
+	dbBytes, err := os.ReadFile("./cybersecurity.db")
+	if err != nil {
+		return err
+	}
+
+	block, err := aes.NewCipher(backupCryptoKey)
+	if err != nil {
+		return err
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return err
+	}
+
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return err
+	}
+
+	// Cifratura asimmetrica sicura del file binario del DB
+	encryptedData := gcm.Seal(nonce, nonce, dbBytes, nil)
+
+	backupFileName := fmt.Sprintf("db_backup_%s.enc", time.Now().Format("20060102_150405"))
+	backupPath := backupDir + "/" + backupFileName
+
+	err = os.WriteFile(backupPath, encryptedData, 0600)
+	if err != nil {
+		return err
+	}
+
+	log.Printf("[🔒 BACKUP COMPLETATO] Il Database è stato isolato e blindato in: %s\n", backupFileName)
+	return nil
 }
 
 func adminReportHandler(w http.ResponseWriter, r *http.Request) {
@@ -272,39 +325,3 @@ func protectedHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {
 		var report ThreatReport
 		if err := json.NewDecoder(r.Body).Decode(&report); err == nil && report.Event != "" {
-			_, _ = DB.Exec("INSERT INTO threat_logs (event, status) VALUES (?, ?)", report.Event, report.Status)
-			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(`{"status":"allerta_ricevuta"}`))
-			return
-		}
-	}
-	w.Write([]byte("🔓 Accesso consentito!"))
-}
-
-func adminDashboardHandler(w http.ResponseWriter, r *http.Request) {
-	authHeader := r.Header.Get("Authorization")
-	if authHeader == "" {
-		http.Error(w, "Accesso negato", http.StatusUnauthorized)
-		return
-	}
-	tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
-	_, err := ValidateToken(tokenStr)
-	if err != nil {
-		http.Error(w, "Accesso negato", http.StatusUnauthorized)
-		return
-	}
-	rows, err := DB.Query("SELECT id, event, status, timestamp FROM threat_logs ORDER BY id DESC")
-	if err != nil {
-		return
-	}
-	defer rows.Close()
-	var logs []ThreatLogEntry
-	for rows.Next() {
-		var entry ThreatLogEntry
-		if err := rows.Scan(&entry.ID, &entry.Event, &entry.Status, &entry.Timestamp); err == nil {
-			logs = append(logs, entry)
-		}
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(logs)
-}
