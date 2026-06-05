@@ -12,6 +12,7 @@ import (
 type UserCredentials struct {
 	Username string `json:"username"`
 	Password string `json:"password"`
+	Role     string `json:"role"` // Campo opzionale per impostare il ruolo in registrazione
 }
 
 type ThreatReport struct {
@@ -26,14 +27,13 @@ type ThreatLogEntry struct {
 	Timestamp string `json:"timestamp"`
 }
 
-// Struttura per leggere l'IP da sbannare
 type UnbanRequest struct {
 	IP string `json:"ip"`
 }
 
 type IPRateLimiter struct {
-	mu           sync.Mutex
-	requests     map[string][]time.Time
+	mu             sync.Mutex
+	requests       map[string][]time.Time
 	violationCount map[string]int
 }
 
@@ -52,14 +52,12 @@ func rateLimitMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		var isBanned int
 		err := DB.QueryRow("SELECT COUNT(*) FROM banned_ips WHERE ip = ?", ip).Scan(&isBanned)
 		if err == nil && isBanned > 0 {
-			log.Printf("[🛡️ FIREWALL] Richiesta RESPINTA ALL'ISTANTE da IP bannato: %s\n", ip)
 			http.Error(w, "💀 Accesso negato permanentemente.", http.StatusForbidden)
 			return
 		}
 
 		Limiter.mu.Lock()
 		now := time.Now()
-		
 		var validRequests []time.Time
 		for _, t := range Limiter.requests[ip] {
 			if now.Sub(t) < 5*time.Second {
@@ -72,15 +70,9 @@ func rateLimitMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			violations := Limiter.violationCount[ip]
 			Limiter.mu.Unlock()
 
-			log.Printf("[🚨 ALLERTA DDoS] Violazione dal'IP: %s. (Violazioni consecutive: %d/3)\n", ip, violations)
-
 			if violations >= 3 {
-				_, dbErr := DB.Exec("INSERT OR IGNORE INTO banned_ips (ip) VALUES (?)", ip)
-				if dbErr == nil {
-					log.Printf("[💀 BAN PERMANENTE] IP %s inserito nel FIREWALL per attacco recidivo!\n", ip)
-				}
+				_, _ = DB.Exec("INSERT OR IGNORE INTO banned_ips (ip) VALUES (?)", ip)
 			}
-
 			http.Error(w, "🛡️ Troppe richieste!", http.StatusTooManyRequests)
 			return
 		}
@@ -96,7 +88,7 @@ func rateLimitMiddleware(next http.HandlerFunc) http.HandlerFunc {
 func main() {
 	InitDB()
 
-	_, err := DB.Exec(`
+	_, _ = DB.Exec(`
 		CREATE TABLE IF NOT EXISTS threat_logs (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			event TEXT,
@@ -104,19 +96,15 @@ func main() {
 			timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
 		);
 	`)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	_, err = DB.Exec(`
+	_, _ = DB.Exec(`
 		CREATE TABLE IF NOT EXISTS banned_ips (
 			ip TEXT PRIMARY KEY,
 			banned_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		);
 	`)
-	if err != nil {
-		log.Fatal(err)
-	}
+
+	// Estendiamo la tabella degli utenti locale per salvare anche il ruolo di sistema
+	_, _ = DB.Exec("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'viewer';")
 
 	go startDatabaseTTLWorker()
 
@@ -124,9 +112,9 @@ func main() {
 	http.HandleFunc("/login", rateLimitMiddleware(loginHandler))
 	http.HandleFunc("/protected", rateLimitMiddleware(protectedHandler))
 	http.HandleFunc("/admin/dashboard", rateLimitMiddleware(adminDashboardHandler))
-	http.HandleFunc("/admin/unban", rateLimitMiddleware(adminUnbanHandler)) // Nuova rotta per sbannare gli IP
+	http.HandleFunc("/admin/unban", rateLimitMiddleware(adminUnbanHandler)) 
 
-	log.Println("🚀 API Gateway attivo con Console di Gestione Unban...")
+	log.Println("🚀 API Gateway attivo con controllo autorizzazioni RBAC (Admin/Viewer)...")
 	if err := http.ListenAndServe(":8080", nil); err != nil {
 		log.Fatal(err)
 	}
@@ -134,55 +122,9 @@ func main() {
 
 func startDatabaseTTLWorker() {
 	for {
-		log.Println("[🧹 SMANEGGIAMENTO] Avvio del controllo di manutenzione del Database...")
 		_, _ = DB.Exec("DELETE FROM threat_logs WHERE timestamp < datetime('now', '-30 days')")
 		time.Sleep(24 * time.Hour)
 	}
-}
-
-// GESTORE DI RECOVREMENTO IP (Sbannamento manuale)
-func adminUnbanHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Metodo non consentito", http.StatusMethodNotAllowed)
-		return
-	}
-
-	// 1. Controllo sicurezza Admin JWT
-	authHeader := r.Header.Get("Authorization")
-	if authHeader == "" {
-		http.Error(w, "Accesso negato", http.StatusUnauthorized)
-		return
-	}
-	tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
-	_, err := ValidateToken(tokenStr)
-	if err != nil {
-		http.Error(w, "Accesso negato", http.StatusUnauthorized)
-		return
-	}
-
-	// 2. Lettura IP da sbloccare
-	var req UnbanRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.IP == "" {
-		http.Error(w, "Dati IP mancanti o errati", http.StatusBadRequest)
-		return
-	}
-
-	// 3. Rimozione dal database del Firewall
-	_, dbErr := DB.Exec("DELETE FROM banned_ips WHERE ip = ?", req.IP)
-	if dbErr != nil {
-		http.Error(w, "Errore durante la rimozione dell'IP dal database", http.StatusInternalServerError)
-		return
-	}
-
-	// 4. Reset dei contatori di violazione in memoria
-	Limiter.mu.Lock()
-	delete(Limiter.violationCount, req.IP)
-	delete(Limiter.requests, req.IP)
-	Limiter.mu.Unlock()
-
-	log.Printf("[🔓 SBLOCCO FIREWALL] L'amministratore ha revocato il ban per l'IP: %s\n", req.IP)
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(`{"message":"IP sbannato con successo e rimosso dal firewall!"}`))
 }
 
 func registerHandler(w http.ResponseWriter, r *http.Request) {
@@ -194,9 +136,17 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&creds); err != nil {
 		return
 	}
+	if creds.Role == "" {
+		creds.Role = "viewer" // Ruolo standard di default se non specificato
+	}
+	
+	// Registra salvando la password hashata (Gestito in auth.go)
 	_ = RegisterUser(creds.Username, creds.Password)
+	// Forza l'aggiornamento del ruolo sul record appena creato per il nostro sistema RBAC
+	_, _ = DB.Exec("UPDATE users SET role = ? WHERE username = ?", creds.Role, creds.Username)
+
 	w.WriteHeader(http.StatusCreated)
-	w.Write([]byte(`{"message":"Utente registrato!"}`))
+	w.Write([]byte(`{"message":"Utente registrato correttamente!"}`))
 }
 
 func loginHandler(w http.ResponseWriter, r *http.Request) {
@@ -213,9 +163,56 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Credenziali errate", http.StatusUnauthorized)
 		return
 	}
-	token, _ := GenerateToken(creds.Username)
+
+	// Recupera il ruolo reale dell'utente memorizzato nel database
+	var role string
+	_ = DB.QueryRow("SELECT role FROM users WHERE username = ?", creds.Username).Scan(&role)
+
+	// Genera il Token JWT includendo il ruolo estratto
+	token, _ := GenerateToken(creds.Username, role)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"token": token})
+}
+
+func adminUnbanHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Metodo non consentito", http.StatusMethodNotAllowed)
+		return
+	}
+
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
+		http.Error(w, "Accesso negato", http.StatusUnauthorized)
+		return
+	}
+	tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
+	payload, err := ValidateToken(tokenStr)
+	if err != nil {
+		http.Error(w, "Accesso negato: Sessione non valida", http.StatusUnauthorized)
+		return
+	}
+
+	// 📑 VERIFICA DEL RUOLO DI SICUREZZA (Controllo RBAC)
+	if !strings.Contains(payload, `"role":"admin"`) {
+		log.Printf("[⚠️ VIOLAZIONE PRIVILEGI] Un utente senza permessi ha tentato di revocare un ban!\n")
+		http.Error(w, "🚫 Azione non consentita: Richiesti privilegi di Amministratore (Admin).", http.StatusForbidden)
+		return
+	}
+
+	var req UnbanRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.IP == "" {
+		http.Error(w, "Dati IP mancanti", http.StatusBadRequest)
+		return
+	}
+
+	_, _ = DB.Exec("DELETE FROM banned_ips WHERE ip = ?", req.IP)
+	Limiter.mu.Lock()
+	delete(Limiter.violationCount, req.IP)
+	delete(Limiter.requests, req.IP)
+	Limiter.mu.Unlock()
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{"message":"IP sbannato dall'Amministratore!"}`))
 }
 
 func protectedHandler(w http.ResponseWriter, r *http.Request) {
@@ -234,11 +231,6 @@ func protectedHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {
 		var report ThreatReport
 		if err := json.NewDecoder(r.Body).Decode(&report); err == nil && report.Event != "" {
-			log.Println("\n" + strings.Repeat("*", 60))
-			log.Printf("[🚨 ALLERTA DI SICUREZZA CRITICA] RILEVATO ATTACCO!")
-			log.Printf("[👉 EVENTO]: %s", report.Event)
-			log.Println(strings.Repeat("*", 60) + "\n")
-
 			_, _ = DB.Exec("INSERT INTO threat_logs (event, status) VALUES (?, ?)", report.Event, report.Status)
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte(`{"status":"allerta_ricevuta"}`))

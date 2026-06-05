@@ -12,9 +12,10 @@ import (
 
 var jwtSecret = []byte("super-segreto-chiave-cybersecurity-2026")
 
-func GenerateToken(username string) (string, error) {
+// Genera un token includendo anche il ruolo dell'utente (es. admin o viewer)
+func GenerateToken(username, role string) (string, error) {
 	h := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
-	pStr := fmt.Sprintf(`{"sub":"%s","exp":%d}`, username, time.Now().Add(time.Hour).Unix())
+	pStr := fmt.Sprintf(`{"sub":"%s","role":"%s","exp":%d}`, username, role, time.Now().Add(time.Hour).Unix())
 	p := base64.RawURLEncoding.EncodeToString([]byte(pStr))
 
 	unsignedToken := h + "." + p
