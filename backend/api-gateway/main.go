@@ -27,19 +27,31 @@ type ThreatLogEntry struct {
 }
 
 type IPRateLimiter struct {
-	mu       sync.Mutex
-	requests map[string][]time.Time
+	mu           sync.Mutex
+	requests     map[string][]time.Time
+	violationCount map[string]int // Traccia quante volte un IP ha violato il limite
 }
 
 var Limiter = IPRateLimiter{
-	requests: make(map[string][]time.Time),
+	requests:       make(map[string][]time.Time),
+	violationCount: make(map[string]int),
 }
 
+// Middleware di controllo avanzato con Firewall / Ban permanente
 func rateLimitMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ip := r.RemoteAddr
 		if idx := strings.LastIndex(ip, ":"); idx != -1 {
 			ip = ip[:idx]
+		}
+
+		// 1. CONTROLLO FIREWALL: Verifica se l'IP è bannato permanentemente nel DB
+		var isBanned int
+		err := DB.QueryRow("SELECT COUNT(*) FROM banned_ips WHERE ip = ?", ip).Scan(&isBanned)
+		if err == nil && isBanned > 0 {
+			log.Printf("[🛡️ FIREWALL] Richiesta RESPINTA ALL'ISTANTE da IP bannato: %s\n", ip)
+			http.Error(w, "💀 Accesso negato permanentemente. Il tuo IP è stato inserito nella blacklist del sistema.", http.StatusForbidden)
+			return
 		}
 
 		Limiter.mu.Lock()
@@ -52,10 +64,23 @@ func rateLimitMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			}
 		}
 
+		// 2. VERIFICA SOGLIA CRITICA
 		if len(validRequests) >= 5 {
+			Limiter.violationCount[ip]++
+			violations := Limiter.violationCount[ip]
 			Limiter.mu.Unlock()
-			log.Printf("[🚨 ALLERTA DDoS] Rilevato traffico anomalo o Brute-Force dall'IP: %s. Richiesta bloccata.\n", ip)
-			http.Error(w, "🛡️ Troppe richieste! Rilevato potenziale attacco. Riprova più tardi.", http.StatusTooManyRequests)
+
+			log.Printf("[🚨 ALLERTA DDoS] Violazione dal'IP: %s. (Violazioni consecutive: %d/3)\n", ip, violations)
+
+			// SE SUPERA LE 3 VIOLAZIONI CONSECUTIVE -> BAN PERMANENTE IN DB
+			if violations >= 3 {
+				_, dbErr := DB.Exec("INSERT OR IGNORE INTO banned_ips (ip) VALUES (?)", ip)
+				if dbErr == nil {
+					log.Printf("[💀 BAN PERMANENTE] IP %s inserito nel FIREWALL per attacco recidivo!\n", ip)
+				}
+			}
+
+			http.Error(w, "🛡️ Troppe richieste! Rilevato potenziale attacco.", http.StatusTooManyRequests)
 			return
 		}
 
@@ -70,6 +95,7 @@ func rateLimitMiddleware(next http.HandlerFunc) http.HandlerFunc {
 func main() {
 	InitDB()
 
+	// Crea la tabella dei log minacce
 	_, err := DB.Exec(`
 		CREATE TABLE IF NOT EXISTS threat_logs (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -79,11 +105,20 @@ func main() {
 		);
 	`)
 	if err != nil {
-		log.Fatal("Errore creazione tabella log minacce:", err)
+		log.Fatal(err)
 	}
 
-	// AVVIO DELLA ROUTINE DI AUTO-PULIZIA (Database TTL)
-	// Gira in background in una goroutine separata
+	// NUOVA TABELLA FIREWALL: Memorizza gli IP bannati permanentemente
+	_, err = DB.Exec(`
+		CREATE TABLE IF NOT EXISTS banned_ips (
+			ip TEXT PRIMARY KEY,
+			banned_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+	`)
+	if err != nil {
+		log.Fatal("Errore creazione tabella firewall:", err)
+	}
+
 	go startDatabaseTTLWorker()
 
 	http.HandleFunc("/register", rateLimitMiddleware(registerHandler))
@@ -91,31 +126,22 @@ func main() {
 	http.HandleFunc("/protected", rateLimitMiddleware(protectedHandler))
 	http.HandleFunc("/admin/dashboard", rateLimitMiddleware(adminDashboardHandler))
 
-	log.Println("🚀 API Gateway in ascolto sulla porta :8080 con protezione DDoS e Auto-Pulizia attive...")
+	log.Println("🚀 API Gateway attivo con FIREWALL permanente e protezione DDoS...")
 	if err := http.ListenAndServe(":8080", nil); err != nil {
 		log.Fatal(err)
 	}
 }
 
-// Funzione Worker: Esegue una pulizia ogni 24 ore
 func startDatabaseTTLWorker() {
 	for {
 		log.Println("[🧹 SMANEGGIAMENTO] Avvio del controllo di manutenzione del Database...")
-		
-		// Elimina i record dove il timestamp è precedente a 30 giorni fa
 		result, err := DB.Exec("DELETE FROM threat_logs WHERE timestamp < datetime('now', '-30 days')")
-		if err != nil {
-			log.Println("[❌] Errore durante l'auto-pulizia dei log:", err)
-		} else {
+		if err == nil {
 			rowsAffected, _ := result.RowsAffected()
 			if rowsAffected > 0 {
-				log.Printf("[🧹 PULIZIA COMPLETATA] Rimossi con successo %d log obsoleti più vecchi di 30 giorni.\n", rowsAffected)
-			} else {
-				log.Println("[📋 MANUTENZIONE] Nessun log obsoleto trovato. Database ottimizzato.")
+				log.Printf("[🧹 PULIZIA COMPLETATA] Rimossi %d log obsoleti.\n", rowsAffected)
 			}
 		}
-
-		// Attende 24 ore prima del prossimo ciclo di pulizia
 		time.Sleep(24 * time.Hour)
 	}
 }
@@ -127,13 +153,9 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	var creds UserCredentials
 	if err := json.NewDecoder(r.Body).Decode(&creds); err != nil {
-		http.Error(w, "Dati non validi", http.StatusBadRequest)
 		return
 	}
-	if err := RegisterUser(creds.Username, creds.Password); err != nil {
-		http.Error(w, "Errore registrazione", http.StatusInternalServerError)
-		return
-	}
+	_ = RegisterUser(creds.Username, creds.Password)
 	w.WriteHeader(http.StatusCreated)
 	w.Write([]byte(`{"message":"Utente registrato!"}`))
 }
@@ -145,7 +167,6 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	var creds UserCredentials
 	if err := json.NewDecoder(r.Body).Decode(&creds); err != nil {
-		http.Error(w, "Dati non validi", http.StatusBadRequest)
 		return
 	}
 	success, err := LoginUser(creds.Username, creds.Password)
@@ -153,11 +174,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Credenziali errate", http.StatusUnauthorized)
 		return
 	}
-	token, err := GenerateToken(creds.Username)
-	if err != nil {
-		http.Error(w, "Errore token", http.StatusInternalServerError)
-		return
-	}
+	token, _ := GenerateToken(creds.Username)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"token": token})
 }
@@ -168,7 +185,6 @@ func protectedHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Token mancante", http.StatusUnauthorized)
 		return
 	}
-
 	tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
 	_, err := ValidateToken(tokenStr)
 	if err != nil {
@@ -180,43 +196,34 @@ func protectedHandler(w http.ResponseWriter, r *http.Request) {
 		var report ThreatReport
 		if err := json.NewDecoder(r.Body).Decode(&report); err == nil && report.Event != "" {
 			log.Println("\n" + strings.Repeat("*", 60))
-			log.Printf("[🚨 ALLERTA DI SICUREZZA CRITICA] RILEVATO ATTACCO SUL DISPOSITIVO!")
+			log.Printf("[🚨 ALLERTA DI SICUREZZA CRITICA] RILEVATO ATTACCO!")
 			log.Printf("[👉 EVENTO]: %s", report.Event)
-			log.Printf("[🔒 STATO OPERATIVO]: %s", report.Status)
 			log.Println(strings.Repeat("*", 60) + "\n")
 
-			_, dbErr := DB.Exec("INSERT INTO threat_logs (event, status) VALUES (?, ?)", report.Event, report.Status)
-			if dbErr != nil {
-				log.Println("[❌] Errore durante il salvataggio del log nel Database:", dbErr)
-			} else {
-				log.Println("[💾] Minaccia registrata correttamente nello storico del Database.")
-			}
-
+			_, _ = DB.Exec("INSERT INTO threat_logs (event, status) VALUES (?, ?)", report.Event, report.Status)
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte(`{"status":"allerta_ricevuta"}`))
 			return
 		}
 	}
-
-	w.Write([]byte("🔓 Accesso consentito! Il canale di comunicazione con il gateway è sicuro."))
+	w.Write([]byte("🔓 Accesso consentito!"))
 }
 
 func adminDashboardHandler(w http.ResponseWriter, r *http.Request) {
 	authHeader := r.Header.Get("Authorization")
 	if authHeader == "" {
-		http.Error(w, "Accesso negato: Token mancante", http.StatusUnauthorized)
+		http.Error(w, "Accesso negato", http.StatusUnauthorized)
 		return
 	}
 	tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
 	_, err := ValidateToken(tokenStr)
 	if err != nil {
-		http.Error(w, "Accesso negato: Sessione non valida", http.StatusUnauthorized)
+		http.Error(w, "Accesso negato", http.StatusUnauthorized)
 		return
 	}
 
 	rows, err := DB.Query("SELECT id, event, status, timestamp FROM threat_logs ORDER BY id DESC")
 	if err != nil {
-		http.Error(w, "Errore caricamento log della console", http.StatusInternalServerError)
 		return
 	}
 	defer rows.Close()
@@ -228,7 +235,6 @@ func adminDashboardHandler(w http.ResponseWriter, r *http.Request) {
 			logs = append(logs, entry)
 		}
 	}
-
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(logs)
 }
