@@ -25,7 +25,7 @@ const hexQuarantineDir = "2f776f726b7370616365732f696e66696e69742d6e756c6c2f7175
 const hexWebhookURL = "68747470733a2f2f6874747062696e2e6f72672f706f7374"               
 
 var cryptoKey = []byte("cyber-secure-key-aes-256-bit-pt")
-var knownUSBDevicesCount = 0 // Traccia il numero di periferiche USB connesse
+var knownUSBDevicesCount = 0 
 
 var fileRegistry = map[string]string{
 	"/workspaces/infinit-null/go.work": "", 
@@ -40,7 +40,7 @@ func decodeString(hexStr string) string {
 }
 
 func main() {
-	log.Println("⚡ Agente di Protezione Hardware e Processi avviato...")
+	log.Println("⚡ Agente di Protezione con Network Intrusion Detection avviato...")
 	
 	err := os.MkdirAll(decodeString(hexQuarantineDir), 0755)
 	if err != nil {
@@ -48,30 +48,52 @@ func main() {
 	}
 
 	initializeFileHashes()
-	initializeUSBCheck() // Conta i dispositivi già presenti all'avvio
+	initializeUSBCheck() 
 
 	for {
 		log.Println("[🔍] Scansione di sicurezza periodica in corso...")
 		checkSuspiciousProcesses()
 		checkFileIntegrity()
-		checkUSBHardwareInjection() // Monitora inserimenti di BadUSB
+		checkUSBHardwareInjection() 
+		checkNetworkIntrusions() // Avvia l'ispezione della rete ad ogni ciclo
 		cleanOldQuarantineFiles() 
 		time.Sleep(10 * time.Second)
 	}
 }
 
-// Inizializza lo stato dell'hardware contando le periferiche collegate
+// DETECTOR DI RETE: Ispezione dei socket e delle porte in ascolto (Backdoor Scanner)
+func checkNetworkIntrusions() {
+	// Lancia il comando 'ss' o 'netstat' per listare le connessioni TCP attive in ascolto su Linux
+	cmd := exec.Command("ss", "-tlnp")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	err := cmd.Run()
+	if err != nil {
+		return
+	}
+
+	outputStr := out.String()
+	// Lista di porte tipiche usate da trojan o backdoor non autorizzate nello sviluppo (es: 4444 di Metasploit, 666)
+	dangerousPorts := []string{":4444", ":666", ":9999"}
+
+	for _, port := range dangerousPorts {
+		if strings.Contains(outputStr, port) {
+			log.Printf("[🚨 INTRUSIONE DI RETE] Rilevata porta sospetta aperta e in ascolto: %s!\n", port)
+			sendWebhookAlert("🚨 ALLERTA BACKDOOR DI RETE", fmt.Sprintf("È stata rilevata una connessione o porta aperta non autorizzata sul dispositivo sulla porta %s. Possibile tentativo di controllo remoto.", port))
+			reportThreatToGateway("Network Intrusion: Suspicious Port Listening " + port)
+		}
+	}
+}
+
 func initializeUSBCheck() {
-	cmd := exec.Command("lsusb") // Comando Linux standard per mappare le USB (funzionante in Codespaces)
+	cmd := exec.Command("lsusb") 
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	_ = cmd.Run()
-	
 	lines := strings.Split(out.String(), "\n")
 	knownUSBDevicesCount = len(lines)
 }
 
-// DETECTOR HARDWARE: Rileva l'inserimento immediato di una BadUSB / Rubber Ducky
 func checkUSBHardwareInjection() {
 	cmd := exec.Command("lsusb")
 	var out bytes.Buffer
@@ -80,20 +102,14 @@ func checkUSBHardwareInjection() {
 	if err != nil {
 		return
 	}
-
 	lines := strings.Split(out.String(), "\n")
 	currentCount := len(lines)
-
-	// Se il numero di dispositivi aumenta, c'è stata un'iniezione hardware di una periferica
 	if currentCount > knownUSBDevicesCount {
-		log.Println("[🚨 HARDWARE INTRUSION] Rilevato NUOVO dispositivo USB inserito nel sistema!")
-		sendWebhookAlert("🚨 ALLERTA INTRUSIONE FISICA USB", "È stato inserito un nuovo dispositivo USB non autorizzato. Possibile attacco BadUSB / Rubber Ducky rilevato e isolato.")
+		log.Println("[🚨 HARDWARE INTRUSION] Nuovo dispositivo USB inserito!")
+		sendWebhookAlert("🚨 ALLERTA INTRUSIONE FISICA USB", "Dispositivo USB non autorizzato rilevato.")
 		reportThreatToGateway("Hardware Intrusion: Unauthorized USB Device Detected")
-		
-		// Aggiorna lo stato per evitare allarmi continui
 		knownUSBDevicesCount = currentCount
 	} else if currentCount < knownUSBDevicesCount {
-		// Se viene rimossa una chiavetta, aggiorna semplicemente il contatore
 		knownUSBDevicesCount = currentCount
 	}
 }
@@ -114,7 +130,6 @@ func cleanOldQuarantineFiles() {
 				continue
 			}
 			if now.Sub(info.ModTime()) > maxAge {
-				log.Printf("[🧹 SHREDDER] File obsoleto: %s. Avvio distruzione...\n", f.Name())
 				shredFile(filePath)
 			}
 		}
@@ -139,7 +154,6 @@ func shredFile(filePath string) {
 	file.Sync()
 	file.Close()
 	_ = os.Remove(filePath)
-	log.Printf("[🗑️ ELIMINATO] File triturato dal dispositivo.\n")
 }
 
 func initializeFileHashes() {
@@ -147,7 +161,6 @@ func initializeFileHashes() {
 		hash, err := calculateFileHash(filePath)
 		if err == nil {
 			fileRegistry[filePath] = hash
-			log.Printf("[📋] Registrato stato iniziale per il file: %s (Hash: %s)\n", filePath, hash[:8])
 		}
 	}
 }
@@ -172,7 +185,6 @@ func checkFileIntegrity() {
 			continue
 		}
 		if oldHash != "" && currentHash != oldHash {
-			log.Printf("[🚨 INTEGRITÀ VIOLATA] Il file %s è stato modificato!\n", filePath)
 			encryptAndIsolateFile(filePath)
 			sendWebhookAlert("🚨 ALLERTA MANOMISSIONE FILE", fmt.Sprintf("Il file %s è stato spostato in quarantena.", filePath))
 			reportThreatToGateway("File Tampering & Encrypted Quarantine: " + filePath)
