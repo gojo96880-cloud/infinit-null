@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -22,7 +23,9 @@ const gatewayURL = "http://localhost:8080/protected"
 const botToken = "IL_TUO_JWT_TOKEN_QUI"
 const quarantineDir = "/workspaces/infinit-null/quarantine"
 
-// Chiave simmetrica a 32 byte per la cifratura AES-256 (In produzione va protetta)
+// URL DEL WEBHOOK (Puoi sostituirlo con un vero URL webhook di Discord o Telegram) [1]
+const securityWebhookURL = "https://httpbin.org" 
+
 var cryptoKey = []byte("cyber-secure-key-aes-256-bit-pt")
 
 var fileRegistry = map[string]string{
@@ -30,7 +33,7 @@ var fileRegistry = map[string]string{
 }
 
 func main() {
-	log.Println("⚡ Agente di Protezione Crittografica Client avviato...")
+	log.Println("⚡ Agente di Protezione con Notifiche Webhook avviato...")
 	
 	err := os.MkdirAll(quarantineDir, 0755)
 	if err != nil {
@@ -81,8 +84,10 @@ func checkFileIntegrity() {
 		if oldHash != "" && currentHash != oldHash {
 			log.Printf("[🚨 INTEGRITÀ VIOLATA] Il file %s è stato modificato abusivamente!\n", filePath)
 			
-			// Chiama la nuova funzione che cifra e isola il file
 			encryptAndIsolateFile(filePath)
+
+			// Invia l'allarme istantaneo al Webhook dell'amministratore [1]
+			sendWebhookAlert("🚨 ALLERTA MANOMISSIONE FILE", fmt.Sprintf("Il file importante %s è stato modificato abusivamente ed è stato spostato in quarantena cifrata AES-256.", filePath))
 
 			reportThreatToGateway("File Tampering & Encrypted Quarantine: " + filePath)
 			fileRegistry[filePath] = currentHash
@@ -90,51 +95,54 @@ func checkFileIntegrity() {
 	}
 }
 
-// Funzione avanzata: legge il file, lo cifra in AES e lo salva in quarantena
 func encryptAndIsolateFile(filePath string) {
-	// 1. Legge il contenuto del file infetto
 	plaintext, err := os.ReadFile(filePath)
 	if err != nil {
-		log.Printf("[❌] Impossibile leggere il file per cifratura: %v. Rimuovo direttamente.\n", err)
 		_ = os.Remove(filePath)
 		return
 	}
 
-	// 2. Inizializza il cifrario AES
 	block, err := aes.NewCipher(cryptoKey)
 	if err != nil {
-		log.Printf("[❌] Errore inizializzazione AES: %v\n", err)
 		return
 	}
 
-	// 3. Genera un vettore di inizializzazione (IV) casuale
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
-		log.Printf("[❌] Errore GCM: %v\n", err)
 		return
 	}
 	nonce := make([]byte, gcm.NonceSize())
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		log.Printf("[❌] Errore generazione nonce: %v\n", err)
 		return
 	}
 
-	// 4. Cifra i dati
 	ciphertext := gcm.Seal(nonce, nonce, plaintext, nil)
 
-	// 5. Salva il file cifrato in quarantena
 	fileName := filepath.Base(filePath)
 	destination := filepath.Join(quarantineDir, fileName+".locked")
 	
-	err = os.WriteFile(destination, ciphertext, 0644)
+	_ = os.WriteFile(destination, ciphertext, 0644)
+	_ = os.Remove(filePath)
+	log.Printf("[🔒 CRYPTO-QUARANTENA] Il file %s è stato cifrato e neutralizzato.\n", fileName)
+}
+
+// FUNZIONE DI INVIO WEBHOOK PER INCIDENTI DI SICUREZZA [1]
+func sendWebhookAlert(title, message string) {
+	payload := map[string]interface{}{
+		"username":   "Security Bot Agent",
+		"avatar_url": "",
+		"content":    fmt.Sprintf("**%s**\n📅 *Data:* %s\n💬 *Dettagli:* %s", title, time.Now().Format("2006-01-02 15:04:05"), message),
+	}
+	
+	jsonData, _ := json.Marshal(payload)
+	
+	resp, err := http.Post(securityWebhookURL, "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
-		log.Printf("[❌] Scrittura file cifrato fallita: %v\n", err)
+		log.Printf("[⚠️ Webhook] Impossibile inviare l'allerta esterna: %v\n", err)
 		return
 	}
-
-	// 6. Elimina il file originale non sicuro dal PC
-	_ = os.Remove(filePath)
-	log.Printf("[🔒 CRYPTO-QUARANTENA] Il file %s è stato cifrato in AES-256 e neutralizzato in: %s\n", fileName, destination)
+	defer resp.Body.Close()
+	log.Println("[🔔 Webhook] Allerta istantanea inviata con successo all'amministratore.")
 }
 
 func checkSuspiciousProcesses() {
@@ -152,6 +160,10 @@ func checkSuspiciousProcesses() {
 	for _, tool := range maliciousTools {
 		if strings.Contains(strings.ToLower(outputStr), tool) {
 			log.Printf("[🚨 MINACCIA RILEVATA] Trovato processo sospetto attivo: %s!\n", tool)
+			
+			// Invia l'allarme istantaneo al Webhook per processo malevolo [1]
+			sendWebhookAlert("💀 PROCESSO MALIGNO RILEVATO", fmt.Sprintf("È stato trovato un tool di hacking attivo sul dispositivo: %s. Il sistema ha bloccato la minaccia.", tool))
+
 			reportThreatToGateway("Suspicious Process: " + tool)
 		}
 	}
