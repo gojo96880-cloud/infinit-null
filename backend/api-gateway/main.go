@@ -12,16 +12,22 @@ type UserCredentials struct {
 	Password string `json:"password"`
 }
 
-// Nuova struttura per ricevere i dati della minaccia inviati dal Bot
 type ThreatReport struct {
 	Event  string `json:"event"`
 	Status string `json:"status"`
 }
 
+// Struttura per inviare i dati storici alla console amministrativa
+type ThreatLogEntry struct {
+	ID        int    `json:"id"`
+	Event     string `json:"event"`
+	Status    string `json:"status"`
+	Timestamp string `json:"timestamp"`
+}
+
 func main() {
 	InitDB()
 
-	// Creiamo la tabella per memorizzare lo storico dei log se non esiste (Opzione A)
 	_, err := DB.Exec(`
 		CREATE TABLE IF NOT EXISTS threat_logs (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -37,6 +43,7 @@ func main() {
 	http.HandleFunc("/register", registerHandler)
 	http.HandleFunc("/login", loginHandler)
 	http.HandleFunc("/protected", protectedHandler)
+	http.HandleFunc("/admin/dashboard", adminDashboardHandler) // Nuova rotta per la console
 
 	log.Println("🚀 API Gateway in ascolto sulla porta :8080...")
 	if err := http.ListenAndServe(":8080", nil); err != nil {
@@ -86,7 +93,6 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"token": token})
 }
 
-// Endpoint modificato per gestire l'allarme visivo e il database log
 func protectedHandler(w http.ResponseWriter, r *http.Request) {
 	authHeader := r.Header.Get("Authorization")
 	if authHeader == "" {
@@ -101,19 +107,15 @@ func protectedHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Se la richiesta contiene un JSON con una minaccia, la gestiamo
 	if r.Method == http.MethodPost {
 		var report ThreatReport
 		if err := json.NewDecoder(r.Body).Decode(&report); err == nil && report.Event != "" {
-			
-			// 1. ALLARME GIGANTE A SCHERMO (Opzione B)
 			log.Println("\n" + strings.Repeat("*", 60))
 			log.Printf("[🚨 ALLERTA DI SICUREZZA CRITICA] RILEVATO ATTACCO SUL DISPOSITIVO!")
 			log.Printf("[👉 EVENTO]: %s", report.Event)
 			log.Printf("[🔒 STATO OPERATIVO]: %s", report.Status)
 			log.Println(strings.Repeat("*", 60) + "\n")
 
-			// 2. SALVATAGGIO PERMANENTE NEL DATABASE (Opzione A)
 			_, dbErr := DB.Exec("INSERT INTO threat_logs (event, status) VALUES (?, ?)", report.Event, report.Status)
 			if dbErr != nil {
 				log.Println("[❌] Errore durante il salvataggio del log nel Database:", dbErr)
@@ -128,4 +130,40 @@ func protectedHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Write([]byte("🔓 Accesso consentito! Il canale di comunicazione con il gateway è sicuro."))
+}
+
+// GESTORE CONSOLE AMMINISTRATIVA: Estrae lo storico delle minacce per l'admin
+func adminDashboardHandler(w http.ResponseWriter, r *http.Request) {
+	// Protezione della console tramite token JWT
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
+		http.Error(w, "Accesso negato: Token mancante", http.StatusUnauthorized)
+		return
+	}
+	tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
+	_, err := ValidateToken(tokenStr)
+	if err != nil {
+		http.Error(w, "Accesso negato: Sessione non valida", http.StatusUnauthorized)
+		return
+	}
+
+	// Estrae tutti i log dal database ordinandoli dal più recente
+	rows, err := DB.Query("SELECT id, event, status, timestamp FROM threat_logs ORDER BY id DESC")
+	if err != nil {
+		http.Error(w, "Errore caricamento log della console", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var logs []ThreatLogEntry
+	for rows.Next() {
+		var entry ThreatLogEntry
+		if err := rows.Scan(&entry.ID, &entry.Event, &entry.Status, &entry.Timestamp); err == nil {
+			logs = append(logs, entry)
+		}
+	}
+
+	// Restituisce l'elenco strutturato in formato JSON
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(logs)
 }
