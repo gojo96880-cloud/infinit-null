@@ -25,7 +25,10 @@ const hexBotToken = "494c5f54554f5f4a57545f544f4b454e5f515549"
 const hexQuarantineDir = "2f776f726b7370616365732f696e66696e69742d6e756c6c2f71756172616e74696e65" 
 const hexWebhookURL = "68747470733a2f2f6874747062696e2e6f72672f706f7374"               
 
-var cryptoKey = []byte("cyber-secure-key-aes-256-bit-pt")
+// CHIAVE OFFUSCATA CON XOR (I byte reali sono mascherati per l'anti-dumping della memoria)
+var obfuscatedCryptoKey = []byte{0x2b, 0x31, 0x2a, 0x3d, 0x35, 0x3b, 0x2b, 0x3d, 0x3d, 0x23, 0x23, 0x23, 0x23, 0x23, 0x23, 0x23, 0x23, 0x23, 0x23, 0x23, 0x23, 0x23, 0x23, 0x23, 0x23, 0x23, 0x23, 0x23, 0x23, 0x23, 0x32, 0x3d}
+const xorMask byte = 0x4A // Maschera XOR per la decodifica al volo
+
 var knownUSBDevicesCount = 0 
 
 var fileRegistry = map[string]string{
@@ -40,8 +43,17 @@ func decodeString(hexStr string) string {
 	return string(bytes)
 }
 
+// Funzione XOR dinamica: estrae la vera chiave AES a 32 byte in memoria solo quando serve
+func getDecryptedKey() []byte {
+	realKey := make([]byte, len(obfuscatedCryptoKey))
+	for i := 0; i < len(obfuscatedCryptoKey); i++ {
+		realKey[i] = obfuscatedCryptoKey[i] ^ xorMask
+	}
+	return realKey
+}
+
 func main() {
-	log.Println("⚡ Agente di Protezione Avanzato con Anti-Rootkit avviato...")
+	log.Println("⚡ Agente di Protezione con XOR Key Obfuscation avviato...")
 	
 	err := os.MkdirAll(decodeString(hexQuarantineDir), 0755)
 	if err != nil {
@@ -57,22 +69,58 @@ func main() {
 		checkFileIntegrity()
 		checkUSBHardwareInjection() 
 		checkNetworkIntrusions() 
-		checkHiddenRootkitProcesses() // Controllo incrociato dei processi nascosti nella RAM
+		checkHiddenRootkitProcesses() 
 		cleanOldQuarantineFiles() 
 		time.Sleep(10 * time.Second)
 	}
 }
 
-// DETECTOR ROOTKIT: Caccia ai PID nascosti nel sistema Linux
+func encryptAndIsolateFile(filePath string) {
+	plaintext, err := os.ReadFile(filePath)
+	if err != nil {
+		_ = os.Remove(filePath)
+		return
+	}
+
+	// Recupera temporaneamente la chiave reale tramite operazione XOR
+	realAESKey := getDecryptedKey()
+	block, err := aes.NewCipher(realAESKey)
+	if err != nil {
+		return
+	}
+
+	// Sovrascrive immediatamente la memoria temporanea della chiave per sicurezza forense
+	defer func() {
+		for i := range realAESKey {
+			realAESKey[i] = 0
+		}
+	}()
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return
+	}
+
+	ciphertext := gcm.Seal(nonce, nonce, plaintext, nil)
+
+	fileName := filepath.Base(filePath)
+	destination := filepath.Join(decodeString(hexQuarantineDir), fileName+".locked")
+	_ = os.WriteFile(destination, ciphertext, 0644)
+	_ = os.Remove(filePath)
+	log.Printf("[🔒 CRYPTO-QUARANTENA] File cifrato con chiave protetta da XOR e isolato.\n")
+}
+
 func checkHiddenRootkitProcesses() {
-	// 1. Prende l'elenco dei PID visibili tramite comando standard
 	cmd := exec.Command("ps", "-e", "-o", "pid")
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	if err := cmd.Run(); err != nil {
 		return
 	}
-
 	visiblePIDs := make(map[string]bool)
 	lines := strings.Split(out.String(), "\n")
 	for _, line := range lines {
@@ -81,26 +129,20 @@ func checkHiddenRootkitProcesses() {
 			visiblePIDs[pid] = true
 		}
 	}
-
-	// 2. Scansiona direttamente il file system di sistema reale /proc
 	procDir, err := os.Open("/proc")
 	if err != nil {
 		return
 	}
 	defer procDir.Close()
-
 	dirs, err := procDir.Readdirnames(0)
 	if err != nil {
 		return
 	}
-
 	for _, name := range dirs {
-		// Controlla se il nome della cartella è un numero (quindi un Process ID reale a livello hardware)
 		if _, err := strconv.Atoi(name); err == nil {
-			// Se il processo esiste a basso livello ma è invisibile al comando 'ps', c'è un Rootkit!
 			if !visiblePIDs[name] {
-				log.Printf("[🚨 ROOTKIT DETECTED] Rilevato processo nascosto in esecuzione! PID hardware: %s\n", name)
-				sendWebhookAlert("🚨 ATTACCO ROOTKIT CRITICO", fmt.Sprintf("Rilevato un processo maligno nascosto a livello di kernel con PID: %s. Il sistema sta monitorando la stabilità.", name))
+				log.Printf("[🚨 ROOTKIT DETECTED] Rilevato processo nascosto! PID: %s\n", name)
+				sendWebhookAlert("🚨 ATTACCO ROOTKIT CRITICO", fmt.Sprintf("Processo maligno nascosto rilevato. PID: %s.", name))
 				reportThreatToGateway("Rootkit Intrusion: Hidden Process PID " + name)
 			}
 		}
@@ -224,37 +266,13 @@ func checkFileIntegrity() {
 			continue
 		}
 		if oldHash != "" && currentHash != oldHash {
+			log.Printf("[🚨 INTEGRITÀ VIOLATA] Il file %s è stato modificato!\n", filePath)
 			encryptAndIsolateFile(filePath)
 			sendWebhookAlert("🚨 ALLERTA MANOMISSIONE FILE", fmt.Sprintf("Il file %s è stato spostato in quarantena.", filePath))
 			reportThreatToGateway("File Tampering & Encrypted Quarantine: " + filePath)
 			fileRegistry[filePath] = currentHash
 		}
 	}
-}
-
-func encryptAndIsolateFile(filePath string) {
-	plaintext, err := os.ReadFile(filePath)
-	if err != nil {
-		_ = os.Remove(filePath)
-		return
-	}
-	block, err := aes.NewCipher(cryptoKey)
-	if err != nil {
-		return
-	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return
-	}
-	nonce := make([]byte, gcm.NonceSize())
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return
-	}
-	ciphertext := gcm.Seal(nonce, nonce, plaintext, nil)
-	fileName := filepath.Base(filePath)
-	destination := filepath.Join(decodeString(hexQuarantineDir), fileName+".locked")
-	_ = os.WriteFile(destination, ciphertext, 0644)
-	_ = os.Remove(filePath)
 }
 
 func sendWebhookAlert(title, message string) {
