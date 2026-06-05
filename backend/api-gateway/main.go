@@ -1,15 +1,10 @@
 package main
 
 import (
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/rand"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -37,6 +32,13 @@ type UnbanRequest struct {
 	IP string `json:"ip"`
 }
 
+// Struttura avanzata per la Dashboard con Statistiche Aggregate
+type DashboardResponse struct {
+	TotalThreatsBlocked int              `json:"total_threats_blocked"`
+	ActiveBannedIPs     int              `json:"active_banned_ips"`
+	RecentLogs          []ThreatLogEntry `json:"recent_logs"`
+}
+
 type IPRateLimiter struct {
 	mu             sync.Mutex
 	requests       map[string][]time.Time
@@ -47,9 +49,6 @@ var Limiter = IPRateLimiter{
 	requests:       make(map[string][]time.Time),
 	violationCount: make(map[string]int),
 }
-
-// Chiave di cifratura simmetrica per i file di backup del DB (AES-256)
-var backupCryptoKey = []byte("key-secure-database-backup-256b")
 
 func rateLimitMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -123,77 +122,73 @@ func main() {
 	_, _ = DB.Exec("CREATE INDEX IF NOT EXISTS idx_threat_logs_timestamp ON threat_logs(timestamp);")
 	_, _ = DB.Exec("CREATE INDEX IF NOT EXISTS idx_threat_logs_id_desc ON threat_logs(id DESC);")
 
-	// AVVIO DELLA ROUTINE DI MANUTENZIONE E BACKUP CIFRATO
-	go startDatabaseManutentionWorker()
+	go startDatabaseTTLWorker()
 
 	http.HandleFunc("/register", rateLimitMiddleware(registerHandler))
 	http.HandleFunc("/login", rateLimitMiddleware(loginHandler))
 	http.HandleFunc("/protected", rateLimitMiddleware(protectedHandler))
-	http.HandleFunc("/admin/dashboard", rateLimitMiddleware(adminDashboardHandler))
+	http.HandleFunc("/admin/dashboard", rateLimitMiddleware(adminDashboardHandler)) // Dashboard con contatore analitico
 	http.HandleFunc("/admin/unban", rateLimitMiddleware(adminUnbanHandler)) 
 	http.HandleFunc("/admin/report", rateLimitMiddleware(adminReportHandler)) 
 
-	log.Println("🚀 API Gateway attivo con modulo di Backup Automatico Cifrato...")
+	log.Println("🚀 API Gateway attivo con Contatore Statistico in tempo reale...")
 	if err := http.ListenAndServe(":8080", nil); err != nil {
 		log.Fatal(err)
 	}
 }
 
-// Worker unico per la manutenzione e il backup sicuro dei dati
-func startDatabaseManutentionWorker() {
-	backupDir := "/workspaces/infinit-null/backups"
-	_ = os.MkdirAll(backupDir, 0755)
-
+func startDatabaseTTLWorker() {
 	for {
-		log.Println("[🧹 MANUTENZIONE] Avvio del ciclo periodico di pulizia log...")
 		_, _ = DB.Exec("DELETE FROM threat_logs WHERE timestamp < datetime('now', '-30 days')")
-
-		log.Println("[💾 BACKUP] Avvio della procedura di backup cifrato AES-256...")
-		err := encryptAndBackupDatabase(backupDir)
-		if err != nil {
-			log.Println("[❌] Errore critico durante la creazione del backup del Database:", err)
-		}
-
-		// Attende 24 ore prima del prossimo ciclo completo
 		time.Sleep(24 * time.Hour)
 	}
 }
 
-// Legge il file SQLite attuale, lo cifra al volo e lo salva in un archivio marcato
-func encryptAndBackupDatabase(backupDir string) error {
-	dbBytes, err := os.ReadFile("./cybersecurity.db")
+func adminDashboardHandler(w http.ResponseWriter, r *http.Request) {
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
+		http.Error(w, "Accesso negato", http.StatusUnauthorized)
+		return
+	}
+	tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
+	_, err := ValidateToken(tokenStr)
 	if err != nil {
-		return err
+		http.Error(w, "Accesso negato", http.StatusUnauthorized)
+		return
 	}
 
-	block, err := aes.NewCipher(backupCryptoKey)
+	// 📊 CALCOLO DELLE METRICHE AGGREGATE
+	var totalThreats int
+	_ = DB.QueryRow("SELECT COUNT(*) FROM threat_logs").Scan(&totalThreats)
+
+	var bannedIPsCount int
+	_ = DB.QueryRow("SELECT COUNT(*) FROM banned_ips").Scan(&bannedIPsCount)
+
+	// Estrazione dei log recenti
+	rows, err := DB.Query("SELECT id, event, status, timestamp FROM threat_logs ORDER BY id DESC LIMIT 50")
 	if err != nil {
-		return err
+		http.Error(w, "Errore caricamento log", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var logs []ThreatLogEntry
+	for rows.Next() {
+		var entry ThreatLogEntry
+		if err := rows.Scan(&entry.ID, &entry.Event, &entry.Status, &entry.Timestamp); err == nil {
+			logs = append(logs, entry)
+		}
 	}
 
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return err
+	// Costruisce la risposta unificata della Dashboard
+	response := DashboardResponse{
+		TotalThreatsBlocked: totalThreats,
+		ActiveBannedIPs:     bannedIPsCount,
+		RecentLogs:          logs,
 	}
 
-	nonce := make([]byte, gcm.NonceSize())
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return err
-	}
-
-	// Cifratura asimmetrica sicura del file binario del DB
-	encryptedData := gcm.Seal(nonce, nonce, dbBytes, nil)
-
-	backupFileName := fmt.Sprintf("db_backup_%s.enc", time.Now().Format("20060102_150405"))
-	backupPath := backupDir + "/" + backupFileName
-
-	err = os.WriteFile(backupPath, encryptedData, 0600)
-	if err != nil {
-		return err
-	}
-
-	log.Printf("[🔒 BACKUP COMPLETATO] Il Database è stato isolato e blindato in: %s\n", backupFileName)
-	return nil
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }
 
 func adminReportHandler(w http.ResponseWriter, r *http.Request) {
