@@ -5,6 +5,8 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 )
 
 type UserCredentials struct {
@@ -17,12 +19,58 @@ type ThreatReport struct {
 	Status string `json:"status"`
 }
 
-// Struttura per inviare i dati storici alla console amministrativa
 type ThreatLogEntry struct {
 	ID        int    `json:"id"`
 	Event     string `json:"event"`
 	Status    string `json:"status"`
 	Timestamp string `json:"timestamp"`
+}
+
+// STRUTTURA PER IL RATE LIMITER (Rilevamento DDoS / Brute-Force)
+type IPRateLimiter struct {
+	mu       sync.Mutex
+	requests map[string][]time.Time
+}
+
+var Limiter = IPRateLimiter{
+	requests: make(map[string][]time.Time),
+}
+
+// Middleware di controllo: Massimo 5 richieste in una finestra di 5 secondi
+func rateLimitMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ip := r.RemoteAddr
+		// Pulisce la porta dal formato dell'IP se presente
+		if idx := strings.LastIndex(ip, ":"); idx != -1 {
+			ip = ip[:idx]
+		}
+
+		Limiter.mu.Lock()
+		now := time.Now()
+		
+		// Rimuove i vecchi timestamp fuori dalla finestra dei 5 secondi
+		var validRequests []time.Time
+		for _, t := range Limiter.requests[ip] {
+			if now.Sub(t) < 5*time.Second {
+				validRequests = append(validRequests, t)
+			}
+		}
+
+		// Verifica se ha superato il limite di 5 richieste
+		if len(validRequests) >= 5 {
+			Limiter.mu.Unlock()
+			log.Printf("[🚨 ALLERTA DDoS] Rilevato traffico anomalo o Brute-Force dall'IP: %s. Richiesta bloccata.\n", ip)
+			http.Error(w, "🛡️ Troppe richieste! Rilevato potenziale attacco. Riprova più tardi.", http.StatusTooManyRequests)
+			return
+		}
+
+		// Aggiunge la richiesta attuale e aggiorna la mappa
+		validRequests = append(validRequests, now)
+		Limiter.requests[ip] = validRequests
+		Limiter.mu.Unlock()
+
+		next(w, r)
+	}
 }
 
 func main() {
@@ -40,12 +88,13 @@ func main() {
 		log.Fatal("Errore creazione tabella log minacce:", err)
 	}
 
-	http.HandleFunc("/register", registerHandler)
-	http.HandleFunc("/login", loginHandler)
-	http.HandleFunc("/protected", protectedHandler)
-	http.HandleFunc("/admin/dashboard", adminDashboardHandler) // Nuova rotta per la console
+	// Applichiamo il filtro protettivo (Middleware) a tutte le rotte pubbliche e sensibili
+	http.HandleFunc("/register", rateLimitMiddleware(registerHandler))
+	http.HandleFunc("/login", rateLimitMiddleware(loginHandler))
+	http.HandleFunc("/protected", rateLimitMiddleware(protectedHandler))
+	http.HandleFunc("/admin/dashboard", rateLimitMiddleware(adminDashboardHandler))
 
-	log.Println("🚀 API Gateway in ascolto sulla porta :8080...")
+	log.Println("🚀 API Gateway in ascolto sulla porta :8080 con protezione DDoS attiva...")
 	if err := http.ListenAndServe(":8080", nil); err != nil {
 		log.Fatal(err)
 	}
@@ -132,9 +181,7 @@ func protectedHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("🔓 Accesso consentito! Il canale di comunicazione con il gateway è sicuro."))
 }
 
-// GESTORE CONSOLE AMMINISTRATIVA: Estrae lo storico delle minacce per l'admin
 func adminDashboardHandler(w http.ResponseWriter, r *http.Request) {
-	// Protezione della console tramite token JWT
 	authHeader := r.Header.Get("Authorization")
 	if authHeader == "" {
 		http.Error(w, "Accesso negato: Token mancante", http.StatusUnauthorized)
@@ -147,7 +194,6 @@ func adminDashboardHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Estrae tutti i log dal database ordinandoli dal più recente
 	rows, err := DB.Query("SELECT id, event, status, timestamp FROM threat_logs ORDER BY id DESC")
 	if err != nil {
 		http.Error(w, "Errore caricamento log della console", http.StatusInternalServerError)
@@ -163,7 +209,6 @@ func adminDashboardHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Restituisce l'elenco strutturato in formato JSON
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(logs)
 }
