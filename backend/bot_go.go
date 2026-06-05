@@ -2,6 +2,9 @@ package main
 
 import (
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -17,16 +20,18 @@ import (
 
 const gatewayURL = "http://localhost:8080/protected"
 const botToken = "IL_TUO_JWT_TOKEN_QUI"
-const quarantineDir = "/workspaces/infinit-null/quarantine" // Percorso della cartella di quarantena
+const quarantineDir = "/workspaces/infinit-null/quarantine"
+
+// Chiave simmetrica a 32 byte per la cifratura AES-256 (In produzione va protetta)
+var cryptoKey = []byte("cyber-secure-key-aes-256-bit-pt")
 
 var fileRegistry = map[string]string{
 	"/workspaces/infinit-null/go.work": "", 
 }
 
 func main() {
-	log.Println("⚡ Agente di Protezione Avanzato con Quarantena avviato...")
+	log.Println("⚡ Agente di Protezione Crittografica Client avviato...")
 	
-	// Crea la cartella di quarantena se non esiste sul dispositivo
 	err := os.MkdirAll(quarantineDir, 0755)
 	if err != nil {
 		log.Fatalf("[❌] Impossibile creare la cartella di quarantena: %v", err)
@@ -76,29 +81,60 @@ func checkFileIntegrity() {
 		if oldHash != "" && currentHash != oldHash {
 			log.Printf("[🚨 INTEGRITÀ VIOLATA] Il file %s è stato modificato abusivamente!\n", filePath)
 			
-			// ATTIVAZIONE QUARANTENA: Isola immediatamente il file compromesso
-			isolateFile(filePath)
+			// Chiama la nuova funzione che cifra e isola il file
+			encryptAndIsolateFile(filePath)
 
-			reportThreatToGateway("File Tampering & Isolate: " + filePath)
+			reportThreatToGateway("File Tampering & Encrypted Quarantine: " + filePath)
 			fileRegistry[filePath] = currentHash
 		}
 	}
 }
 
-// Funzione di isolamento balistico del file infetto
-func isolateFile(filePath string) {
-	fileName := filepath.Base(filePath)
-	destination := filepath.Join(quarantineDir, fileName+"_compromised_"+time.Now().Format("20060102_150405"))
-
-	// Sposta il file nella directory di quarantena per bloccarne l'esecuzione
-	err := os.Rename(filePath, destination)
+// Funzione avanzata: legge il file, lo cifra in AES e lo salva in quarantena
+func encryptAndIsolateFile(filePath string) {
+	// 1. Legge il contenuto del file infetto
+	plaintext, err := os.ReadFile(filePath)
 	if err != nil {
-		log.Printf("[❌] Spostamento in quarantena fallito per %s: %v. Tento la rimozione sicura...\n", fileName, err)
-		_ = os.Remove(filePath) // Se non riesce a spostarlo, lo elimina per sicurezza
+		log.Printf("[❌] Impossibile leggere il file per cifratura: %v. Rimuovo direttamente.\n", err)
+		_ = os.Remove(filePath)
 		return
 	}
 
-	log.Printf("[🔒 QUARANTENA] File pericoloso NEUTRALIZZATO e spostato in: %s\n", destination)
+	// 2. Inizializza il cifrario AES
+	block, err := aes.NewCipher(cryptoKey)
+	if err != nil {
+		log.Printf("[❌] Errore inizializzazione AES: %v\n", err)
+		return
+	}
+
+	// 3. Genera un vettore di inizializzazione (IV) casuale
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		log.Printf("[❌] Errore GCM: %v\n", err)
+		return
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		log.Printf("[❌] Errore generazione nonce: %v\n", err)
+		return
+	}
+
+	// 4. Cifra i dati
+	ciphertext := gcm.Seal(nonce, nonce, plaintext, nil)
+
+	// 5. Salva il file cifrato in quarantena
+	fileName := filepath.Base(filePath)
+	destination := filepath.Join(quarantineDir, fileName+".locked")
+	
+	err = os.WriteFile(destination, ciphertext, 0644)
+	if err != nil {
+		log.Printf("[❌] Scrittura file cifrato fallita: %v\n", err)
+		return
+	}
+
+	// 6. Elimina il file originale non sicuro dal PC
+	_ = os.Remove(filePath)
+	log.Printf("[🔒 CRYPTO-QUARANTENA] Il file %s è stato cifrato in AES-256 e neutralizzato in: %s\n", fileName, destination)
 }
 
 func checkSuspiciousProcesses() {
@@ -124,7 +160,7 @@ func checkSuspiciousProcesses() {
 func reportThreatToGateway(threatType string) {
 	data := map[string]string{
 		"event":  threatType,
-		"status": "Blocked & Isolated",
+		"status": "Cifrato & Isolato",
 	}
 	jsonData, _ := json.Marshal(data)
 
@@ -135,9 +171,7 @@ func reportThreatToGateway(threatType string) {
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Printf("[⚠️] API Gateway offline. Allerta archiviata localmente per: %s\n", threatType)
 		return
 	}
 	defer resp.Body.Close()
-	log.Printf("[✅] Allerta inviata. Risposta server: %s\n", resp.Status)
 }
