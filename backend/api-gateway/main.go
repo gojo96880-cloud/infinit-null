@@ -89,7 +89,8 @@ func rateLimitMiddleware(next http.HandlerFunc) http.HandlerFunc {
 func main() {
 	InitDB()
 
-	_, _ = DB.Exec(`
+	// 1. Tabella dei Log Minacce
+	_, err := DB.Exec(`
 		CREATE TABLE IF NOT EXISTS threat_logs (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			event TEXT,
@@ -97,14 +98,28 @@ func main() {
 			timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
 		);
 	`)
-	_, _ = DB.Exec(`
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// 2. Tabella Firewall per IP Bannati
+	_, err = DB.Exec(`
 		CREATE TABLE IF NOT EXISTS banned_ips (
 			ip TEXT PRIMARY KEY,
 			banned_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		);
 	`)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	_, _ = DB.Exec("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'viewer';")
+
+	// ⚡ CREAZIONE DEGLI INDICI SQL PER LE PRESTAZIONI (Ottimizzazione Query di Ricerca)
+	// Indice per cercare all'istante i log in base alla data (usato dal Worker di pulizia e dai Report)
+	_, _ = DB.Exec("CREATE INDEX IF NOT EXISTS idx_threat_logs_timestamp ON threat_logs(timestamp);")
+	// Indice per velocizzare l'ordinamento decrescente dei log nella Dashboard Amministrativa
+	_, _ = DB.Exec("CREATE INDEX IF NOT EXISTS idx_threat_logs_id_desc ON threat_logs(id DESC);")
 
 	go startDatabaseTTLWorker()
 
@@ -113,9 +128,9 @@ func main() {
 	http.HandleFunc("/protected", rateLimitMiddleware(protectedHandler))
 	http.HandleFunc("/admin/dashboard", rateLimitMiddleware(adminDashboardHandler))
 	http.HandleFunc("/admin/unban", rateLimitMiddleware(adminUnbanHandler)) 
-	http.HandleFunc("/admin/report", rateLimitMiddleware(adminReportHandler)) // Nuova rotta per scaricare il report di audit
+	http.HandleFunc("/admin/report", rateLimitMiddleware(adminReportHandler)) 
 
-	log.Println("🚀 API Gateway attivo con Generatore Report di Sicurezza integrato...")
+	log.Println("🚀 API Gateway attivo e ottimizzato con Indici SQL di ricerca rapida...")
 	if err := http.ListenAndServe(":8080", nil); err != nil {
 		log.Fatal(err)
 	}
@@ -128,7 +143,6 @@ func startDatabaseTTLWorker() {
 	}
 }
 
-// GESTORE GENERAZIONE REPORT IN FORMATO TESTO SCARICABILE
 func adminReportHandler(w http.ResponseWriter, r *http.Request) {
 	authHeader := r.Header.Get("Authorization")
 	if authHeader == "" {
@@ -142,7 +156,6 @@ func adminReportHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Estrae i log dal database
 	rows, err := DB.Query("SELECT id, event, status, timestamp FROM threat_logs ORDER BY id DESC")
 	if err != nil {
 		http.Error(w, "Errore estrazione dati", http.StatusInternalServerError)
@@ -150,7 +163,6 @@ func adminReportHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-	// Costruisce la struttura del file di testo stringa per stringa
 	var reportBuilder strings.Builder
 	reportBuilder.WriteString("============================================================\n")
 	reportBuilder.WriteString("      REPORT DI AUDIT DI SICUREZZA - ENTERPRISE PLATFORM     \n")
@@ -172,7 +184,6 @@ func adminReportHandler(w http.ResponseWriter, r *http.Request) {
 	reportBuilder.WriteString(fmt.Sprintf("\n📊 Riepilogo complessivo: Rilevate ed Evitate %d minacce negli ultimi 30 giorni.\n", count))
 	reportBuilder.WriteString("🏁 Fine del Documento Ufficiale di Audit.\n")
 
-	// Forza il browser a scaricare la risposta sotto forma di file di testo .txt
 	w.Header().Set("Content-Disposition", "attachment; filename=report_sicurezza.txt")
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Write([]byte(reportBuilder.String()))
