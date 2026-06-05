@@ -32,7 +32,6 @@ type UnbanRequest struct {
 	IP string `json:"ip"`
 }
 
-// Struttura avanzata per la Dashboard con Statistiche Aggregate
 type DashboardResponse struct {
 	TotalThreatsBlocked int              `json:"total_threats_blocked"`
 	ActiveBannedIPs     int              `json:"active_banned_ips"`
@@ -48,6 +47,21 @@ type IPRateLimiter struct {
 var Limiter = IPRateLimiter{
 	requests:       make(map[string][]time.Time),
 	violationCount: make(map[string]int),
+}
+
+// 🛡️ MOTORE DI SANIFICAZIONE: Rileva pattern di SQL Injection comuni
+func isSQLInjection(input string) bool {
+	cleanInput := strings.ToLower(input)
+	patterns := []string{
+		"' or", "\" or", "or 1=1", "or '1'='1", "union select", 
+		"insert into", "drop table", "alter table", "--", "select *",
+	}
+	for _, pattern := range patterns {
+		if strings.Contains(cleanInput, pattern) {
+			return true
+		}
+	}
+	return false
 }
 
 func rateLimitMiddleware(next http.HandlerFunc) http.HandlerFunc {
@@ -127,11 +141,11 @@ func main() {
 	http.HandleFunc("/register", rateLimitMiddleware(registerHandler))
 	http.HandleFunc("/login", rateLimitMiddleware(loginHandler))
 	http.HandleFunc("/protected", rateLimitMiddleware(protectedHandler))
-	http.HandleFunc("/admin/dashboard", rateLimitMiddleware(adminDashboardHandler)) // Dashboard con contatore analitico
+	http.HandleFunc("/admin/dashboard", rateLimitMiddleware(adminDashboardHandler)) 
 	http.HandleFunc("/admin/unban", rateLimitMiddleware(adminUnbanHandler)) 
 	http.HandleFunc("/admin/report", rateLimitMiddleware(adminReportHandler)) 
 
-	log.Println("🚀 API Gateway attivo con Contatore Statistico in tempo reale...")
+	log.Println("🚀 API Gateway attivo con modulo Anti-SQL Injection...")
 	if err := http.ListenAndServe(":8080", nil); err != nil {
 		log.Fatal(err)
 	}
@@ -144,99 +158,6 @@ func startDatabaseTTLWorker() {
 	}
 }
 
-func adminDashboardHandler(w http.ResponseWriter, r *http.Request) {
-	authHeader := r.Header.Get("Authorization")
-	if authHeader == "" {
-		http.Error(w, "Accesso negato", http.StatusUnauthorized)
-		return
-	}
-	tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
-	_, err := ValidateToken(tokenStr)
-	if err != nil {
-		http.Error(w, "Accesso negato", http.StatusUnauthorized)
-		return
-	}
-
-	// 📊 CALCOLO DELLE METRICHE AGGREGATE
-	var totalThreats int
-	_ = DB.QueryRow("SELECT COUNT(*) FROM threat_logs").Scan(&totalThreats)
-
-	var bannedIPsCount int
-	_ = DB.QueryRow("SELECT COUNT(*) FROM banned_ips").Scan(&bannedIPsCount)
-
-	// Estrazione dei log recenti
-	rows, err := DB.Query("SELECT id, event, status, timestamp FROM threat_logs ORDER BY id DESC LIMIT 50")
-	if err != nil {
-		http.Error(w, "Errore caricamento log", http.StatusInternalServerError)
-		return
-	}
-	defer rows.Close()
-
-	var logs []ThreatLogEntry
-	for rows.Next() {
-		var entry ThreatLogEntry
-		if err := rows.Scan(&entry.ID, &entry.Event, &entry.Status, &entry.Timestamp); err == nil {
-			logs = append(logs, entry)
-		}
-	}
-
-	// Costruisce la risposta unificata della Dashboard
-	response := DashboardResponse{
-		TotalThreatsBlocked: totalThreats,
-		ActiveBannedIPs:     bannedIPsCount,
-		RecentLogs:          logs,
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
-}
-
-func adminReportHandler(w http.ResponseWriter, r *http.Request) {
-	authHeader := r.Header.Get("Authorization")
-	if authHeader == "" {
-		http.Error(w, "Accesso negato", http.StatusUnauthorized)
-		return
-	}
-	tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
-	payload, err := ValidateToken(tokenStr)
-	if err != nil || !strings.Contains(payload, `"role":"admin"`) {
-		http.Error(w, "🚫 Privilegi di Amministratore richiesti.", http.StatusForbidden)
-		return
-	}
-
-	rows, err := DB.Query("SELECT id, event, status, timestamp FROM threat_logs ORDER BY id DESC")
-	if err != nil {
-		http.Error(w, "Errore estrazione dati", http.StatusInternalServerError)
-		return
-	}
-	defer rows.Close()
-
-	var reportBuilder strings.Builder
-	reportBuilder.WriteString("============================================================\n")
-	reportBuilder.WriteString("      REPORT DI AUDIT DI SICUREZZA - ENTERPRISE PLATFORM     \n")
-	reportBuilder.WriteString(fmt.Sprintf("📅 Data Generazione: %s\n", time.Now().Format("2006-01-02 15:04:05")))
-	reportBuilder.WriteString("============================================================\n\n")
-
-	count := 0
-	for rows.Next() {
-		var entry ThreatLogEntry
-		if err := rows.Scan(&entry.ID, &entry.Event, &entry.Status, &entry.Timestamp); err == nil {
-			count++
-			reportBuilder.WriteString(fmt.Sprintf("[%d] ⏰ DATA: %s\n", count, entry.Timestamp))
-			reportBuilder.WriteString(fmt.Sprintf("    ⚠️ INTERCETTAZIONE: %s\n", entry.Event))
-			reportBuilder.WriteString(fmt.Sprintf("    🔒 STATO PROTEZIONE: %s\n", entry.Status))
-			reportBuilder.WriteString("------------------------------------------------------------\n")
-		}
-	}
-
-	reportBuilder.WriteString(fmt.Sprintf("\n📊 Riepilogo complessivo: Rilevate ed Evitate %d minacce negli ultimi 30 giorni.\n", count))
-	reportBuilder.WriteString("🏁 Fine del Documento Ufficiale di Audit.\n")
-
-	w.Header().Set("Content-Disposition", "attachment; filename=report_sicurezza.txt")
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.Write([]byte(reportBuilder.String()))
-}
-
 func registerHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Metodo non consentito", http.StatusMethodNotAllowed)
@@ -246,6 +167,15 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&creds); err != nil {
 		return
 	}
+
+	// CONTROLLO ANTI-SQL INJECTION SULLE STRINGHE INSERITE
+	if isSQLInjection(creds.Username) || isSQLInjection(creds.Password) {
+		log.Printf("[🚨 INFRAZIONE SPECULATIVA] Bloccato tentativo di SQL Injection in registrazione!")
+		_, _ = DB.Exec("INSERT INTO threat_logs (event, status) VALUES (?, ?)", "SQL Injection Attempted via Registration", "Blocked")
+		http.Error(w, "🛡️ Input non valido rilevato dal firewall applicativo.", http.StatusBadRequest)
+		return
+	}
+
 	if creds.Role == "" {
 		creds.Role = "viewer"
 	}
@@ -264,6 +194,15 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&creds); err != nil {
 		return
 	}
+
+	// CONTROLLO ANTI-SQL INJECTION SUL LOGIN
+	if isSQLInjection(creds.Username) || isSQLInjection(creds.Password) {
+		log.Printf("[🚨 INFRAZIONE SPECULATIVA] Bloccato tentativo di SQL Injection in login!")
+		_, _ = DB.Exec("INSERT INTO threat_logs (event, status) VALUES (?, ?)", "SQL Injection Attempted via Login", "Blocked")
+		http.Error(w, "🛡️ Credenziali o formato non consentito.", http.StatusBadRequest)
+		return
+	}
+
 	success, err := LoginUser(creds.Username, creds.Password)
 	if err != nil || !success {
 		http.Error(w, "Credenziali errate", http.StatusUnauthorized)
@@ -320,3 +259,69 @@ func protectedHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {
 		var report ThreatReport
 		if err := json.NewDecoder(r.Body).Decode(&report); err == nil && report.Event != "" {
+			_, _ = DB.Exec("INSERT INTO threat_logs (event, status) VALUES (?, ?)", report.Event, report.Status)
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"status":"allerta_ricevuta"}`))
+			return
+		}
+	}
+	w.Write([]byte("🔓 Accesso consentito!"))
+}
+
+func adminDashboardHandler(w http.ResponseWriter, r *http.Request) {
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
+		http.Error(w, "Accesso negato", http.StatusUnauthorized)
+		return
+	}
+	tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
+	_, err := ValidateToken(tokenStr)
+	if err != nil {
+		http.Error(w, "Accesso negato", http.StatusUnauthorized)
+		return
+	}
+	var totalThreats int
+	_ = DB.QueryRow("SELECT COUNT(*) FROM threat_logs").Scan(&totalThreats)
+	var bannedIPsCount int
+	_ = DB.QueryRow("SELECT COUNT(*) FROM banned_ips").Scan(&bannedIPsCount)
+	rows, err := DB.Query("SELECT id, event, status, timestamp FROM threat_logs ORDER BY id DESC LIMIT 50")
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	var logs []ThreatLogEntry
+	for rows.Next() {
+		var entry ThreatLogEntry
+		if err := rows.Scan(&entry.ID, &entry.Event, &entry.Status, &entry.Timestamp); err == nil {
+			logs = append(logs, entry)
+		}
+	}
+	response := DashboardResponse{
+		TotalThreatsBlocked: totalThreats,
+		ActiveBannedIPs:     bannedIPsCount,
+		RecentLogs:          logs,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+func adminReportHandler(w http.ResponseWriter, r *http.Request) {
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
+		http.Error(w, "Accesso negato", http.StatusUnauthorized)
+		return
+	}
+	tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
+	payload, err := ValidateToken(tokenStr)
+	if err != nil || !strings.Contains(payload, `"role":"admin"`) {
+		http.Error(w, "🚫 Privilegi di Amministratore richiesti.", http.StatusForbidden)
+		return
+	}
+	rows, err := DB.Query("SELECT id, event, status, timestamp FROM threat_logs ORDER BY id DESC")
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	var reportBuilder strings.Builder
+	reportBuilder.WriteString("============================================================\n")
+	reportBuilder.WriteString("      REPORT DI AUDIT DI SICUREZZA - ENTERPRISE PLATFORM     \n")
