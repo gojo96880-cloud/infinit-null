@@ -26,10 +26,15 @@ type ThreatLogEntry struct {
 	Timestamp string `json:"timestamp"`
 }
 
+// Struttura per leggere l'IP da sbannare
+type UnbanRequest struct {
+	IP string `json:"ip"`
+}
+
 type IPRateLimiter struct {
 	mu           sync.Mutex
 	requests     map[string][]time.Time
-	violationCount map[string]int // Traccia quante volte un IP ha violato il limite
+	violationCount map[string]int
 }
 
 var Limiter = IPRateLimiter{
@@ -37,7 +42,6 @@ var Limiter = IPRateLimiter{
 	violationCount: make(map[string]int),
 }
 
-// Middleware di controllo avanzato con Firewall / Ban permanente
 func rateLimitMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ip := r.RemoteAddr
@@ -45,12 +49,11 @@ func rateLimitMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			ip = ip[:idx]
 		}
 
-		// 1. CONTROLLO FIREWALL: Verifica se l'IP è bannato permanentemente nel DB
 		var isBanned int
 		err := DB.QueryRow("SELECT COUNT(*) FROM banned_ips WHERE ip = ?", ip).Scan(&isBanned)
 		if err == nil && isBanned > 0 {
 			log.Printf("[🛡️ FIREWALL] Richiesta RESPINTA ALL'ISTANTE da IP bannato: %s\n", ip)
-			http.Error(w, "💀 Accesso negato permanentemente. Il tuo IP è stato inserito nella blacklist del sistema.", http.StatusForbidden)
+			http.Error(w, "💀 Accesso negato permanentemente.", http.StatusForbidden)
 			return
 		}
 
@@ -64,7 +67,6 @@ func rateLimitMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			}
 		}
 
-		// 2. VERIFICA SOGLIA CRITICA
 		if len(validRequests) >= 5 {
 			Limiter.violationCount[ip]++
 			violations := Limiter.violationCount[ip]
@@ -72,7 +74,6 @@ func rateLimitMiddleware(next http.HandlerFunc) http.HandlerFunc {
 
 			log.Printf("[🚨 ALLERTA DDoS] Violazione dal'IP: %s. (Violazioni consecutive: %d/3)\n", ip, violations)
 
-			// SE SUPERA LE 3 VIOLAZIONI CONSECUTIVE -> BAN PERMANENTE IN DB
 			if violations >= 3 {
 				_, dbErr := DB.Exec("INSERT OR IGNORE INTO banned_ips (ip) VALUES (?)", ip)
 				if dbErr == nil {
@@ -80,7 +81,7 @@ func rateLimitMiddleware(next http.HandlerFunc) http.HandlerFunc {
 				}
 			}
 
-			http.Error(w, "🛡️ Troppe richieste! Rilevato potenziale attacco.", http.StatusTooManyRequests)
+			http.Error(w, "🛡️ Troppe richieste!", http.StatusTooManyRequests)
 			return
 		}
 
@@ -95,7 +96,6 @@ func rateLimitMiddleware(next http.HandlerFunc) http.HandlerFunc {
 func main() {
 	InitDB()
 
-	// Crea la tabella dei log minacce
 	_, err := DB.Exec(`
 		CREATE TABLE IF NOT EXISTS threat_logs (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -108,7 +108,6 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// NUOVA TABELLA FIREWALL: Memorizza gli IP bannati permanentemente
 	_, err = DB.Exec(`
 		CREATE TABLE IF NOT EXISTS banned_ips (
 			ip TEXT PRIMARY KEY,
@@ -116,7 +115,7 @@ func main() {
 		);
 	`)
 	if err != nil {
-		log.Fatal("Errore creazione tabella firewall:", err)
+		log.Fatal(err)
 	}
 
 	go startDatabaseTTLWorker()
@@ -125,8 +124,9 @@ func main() {
 	http.HandleFunc("/login", rateLimitMiddleware(loginHandler))
 	http.HandleFunc("/protected", rateLimitMiddleware(protectedHandler))
 	http.HandleFunc("/admin/dashboard", rateLimitMiddleware(adminDashboardHandler))
+	http.HandleFunc("/admin/unban", rateLimitMiddleware(adminUnbanHandler)) // Nuova rotta per sbannare gli IP
 
-	log.Println("🚀 API Gateway attivo con FIREWALL permanente e protezione DDoS...")
+	log.Println("🚀 API Gateway attivo con Console di Gestione Unban...")
 	if err := http.ListenAndServe(":8080", nil); err != nil {
 		log.Fatal(err)
 	}
@@ -135,15 +135,54 @@ func main() {
 func startDatabaseTTLWorker() {
 	for {
 		log.Println("[🧹 SMANEGGIAMENTO] Avvio del controllo di manutenzione del Database...")
-		result, err := DB.Exec("DELETE FROM threat_logs WHERE timestamp < datetime('now', '-30 days')")
-		if err == nil {
-			rowsAffected, _ := result.RowsAffected()
-			if rowsAffected > 0 {
-				log.Printf("[🧹 PULIZIA COMPLETATA] Rimossi %d log obsoleti.\n", rowsAffected)
-			}
-		}
+		_, _ = DB.Exec("DELETE FROM threat_logs WHERE timestamp < datetime('now', '-30 days')")
 		time.Sleep(24 * time.Hour)
 	}
+}
+
+// GESTORE DI RECOVREMENTO IP (Sbannamento manuale)
+func adminUnbanHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Metodo non consentito", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// 1. Controllo sicurezza Admin JWT
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
+		http.Error(w, "Accesso negato", http.StatusUnauthorized)
+		return
+	}
+	tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
+	_, err := ValidateToken(tokenStr)
+	if err != nil {
+		http.Error(w, "Accesso negato", http.StatusUnauthorized)
+		return
+	}
+
+	// 2. Lettura IP da sbloccare
+	var req UnbanRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.IP == "" {
+		http.Error(w, "Dati IP mancanti o errati", http.StatusBadRequest)
+		return
+	}
+
+	// 3. Rimozione dal database del Firewall
+	_, dbErr := DB.Exec("DELETE FROM banned_ips WHERE ip = ?", req.IP)
+	if dbErr != nil {
+		http.Error(w, "Errore durante la rimozione dell'IP dal database", http.StatusInternalServerError)
+		return
+	}
+
+	// 4. Reset dei contatori di violazione in memoria
+	Limiter.mu.Lock()
+	delete(Limiter.violationCount, req.IP)
+	delete(Limiter.requests, req.IP)
+	Limiter.mu.Unlock()
+
+	log.Printf("[🔓 SBLOCCO FIREWALL] L'amministratore ha revocato il ban per l'IP: %s\n", req.IP)
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{"message":"IP sbannato con successo e rimosso dal firewall!"}`))
 }
 
 func registerHandler(w http.ResponseWriter, r *http.Request) {
