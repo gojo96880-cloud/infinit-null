@@ -25,6 +25,7 @@ const hexQuarantineDir = "2f776f726b7370616365732f696e66696e69742d6e756c6c2f7175
 const hexWebhookURL = "68747470733a2f2f6874747062696e2e6f72672f706f7374"               
 
 var cryptoKey = []byte("cyber-secure-key-aes-256-bit-pt")
+var knownUSBDevicesCount = 0 // Traccia il numero di periferiche USB connesse
 
 var fileRegistry = map[string]string{
 	"/workspaces/infinit-null/go.work": "", 
@@ -39,7 +40,7 @@ func decodeString(hexStr string) string {
 }
 
 func main() {
-	log.Println("⚡ Agente di Protezione con Data Shredder avviato...")
+	log.Println("⚡ Agente di Protezione Hardware e Processi avviato...")
 	
 	err := os.MkdirAll(decodeString(hexQuarantineDir), 0755)
 	if err != nil {
@@ -47,27 +48,64 @@ func main() {
 	}
 
 	initializeFileHashes()
+	initializeUSBCheck() // Conta i dispositivi già presenti all'avvio
 
 	for {
 		log.Println("[🔍] Scansione di sicurezza periodica in corso...")
 		checkSuspiciousProcesses()
 		checkFileIntegrity()
-		cleanOldQuarantineFiles() // Avvia il controllo sui file obsoleti ad ogni ciclo
+		checkUSBHardwareInjection() // Monitora inserimenti di BadUSB
+		cleanOldQuarantineFiles() 
 		time.Sleep(10 * time.Second)
 	}
 }
 
-// FUNZIONE DI DISTRUZIONE SICURA (Shredder dei file vecchi di 7 giorni)
+// Inizializza lo stato dell'hardware contando le periferiche collegate
+func initializeUSBCheck() {
+	cmd := exec.Command("lsusb") // Comando Linux standard per mappare le USB (funzionante in Codespaces)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	_ = cmd.Run()
+	
+	lines := strings.Split(out.String(), "\n")
+	knownUSBDevicesCount = len(lines)
+}
+
+// DETECTOR HARDWARE: Rileva l'inserimento immediato di una BadUSB / Rubber Ducky
+func checkUSBHardwareInjection() {
+	cmd := exec.Command("lsusb")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	err := cmd.Run()
+	if err != nil {
+		return
+	}
+
+	lines := strings.Split(out.String(), "\n")
+	currentCount := len(lines)
+
+	// Se il numero di dispositivi aumenta, c'è stata un'iniezione hardware di una periferica
+	if currentCount > knownUSBDevicesCount {
+		log.Println("[🚨 HARDWARE INTRUSION] Rilevato NUOVO dispositivo USB inserito nel sistema!")
+		sendWebhookAlert("🚨 ALLERTA INTRUSIONE FISICA USB", "È stato inserito un nuovo dispositivo USB non autorizzato. Possibile attacco BadUSB / Rubber Ducky rilevato e isolato.")
+		reportThreatToGateway("Hardware Intrusion: Unauthorized USB Device Detected")
+		
+		// Aggiorna lo stato per evitare allarmi continui
+		knownUSBDevicesCount = currentCount
+	} else if currentCount < knownUSBDevicesCount {
+		// Se viene rimossa una chiavetta, aggiorna semplicemente il contatore
+		knownUSBDevicesCount = currentCount
+	}
+}
+
 func cleanOldQuarantineFiles() {
 	dirPath := decodeString(hexQuarantineDir)
 	files, err := os.ReadDir(dirPath)
 	if err != nil {
 		return
 	}
-
 	now := time.Now()
-	maxAge := 7 * 24 * time.Hour // Tempo massimo di conservazione: 7 giorni
-
+	maxAge := 7 * 24 * time.Hour
 	for _, f := range files {
 		if !f.IsDir() && strings.HasSuffix(f.Name(), ".locked") {
 			filePath := filepath.Join(dirPath, f.Name())
@@ -75,43 +113,33 @@ func cleanOldQuarantineFiles() {
 			if err != nil {
 				continue
 			}
-
-			// Se il file supera l'età massima, viene triturato
 			if now.Sub(info.ModTime()) > maxAge {
-				log.Printf("[🧹 SHREDDER] Il file in quarantena %s è obsoleto. Avvio distruzione sicura...\n", f.Name())
+				log.Printf("[🧹 SHREDDER] File obsoleto: %s. Avvio distruzione...\n", f.Name())
 				shredFile(filePath)
 			}
 		}
 	}
 }
 
-// Tritura il file sovrascrivendolo prima di eliminarlo (Anti-Forensics)
 func shredFile(filePath string) {
 	info, err := os.Stat(filePath)
 	if err != nil {
 		_ = os.Remove(filePath)
 		return
 	}
-
 	file, err := os.OpenFile(filePath, os.O_WRONLY, 0)
 	if err != nil {
 		_ = os.Remove(filePath)
 		return
 	}
 	defer file.Close()
-
-	// Crea un blocco di byte casuali della stessa dimensione del file
 	randomBytes := make([]byte, info.Size())
 	_, _ = rand.Read(randomBytes)
-
-	// Sovrascrive i dati reali sul disco
 	_, _ = file.Write(randomBytes)
 	file.Sync()
 	file.Close()
-
-	// Elimina il file dal sistema
 	_ = os.Remove(filePath)
-	log.Printf("[🗑️ ELIMINATO] File triturato e rimosso permanentemente dal dispositivo.\n")
+	log.Printf("[🗑️ ELIMINATO] File triturato dal dispositivo.\n")
 }
 
 func initializeFileHashes() {
@@ -130,7 +158,6 @@ func calculateFileHash(filePath string) (string, error) {
 		return "", err
 	}
 	defer file.Close()
-
 	hasher := sha256.New()
 	if _, err := io.Copy(hasher, file); err != nil {
 		return "", err
@@ -144,11 +171,10 @@ func checkFileIntegrity() {
 		if err != nil {
 			continue
 		}
-
 		if oldHash != "" && currentHash != oldHash {
-			log.Printf("[🚨 INTEGRITÀ VIOLATA] Il file %s è stato modificato abusivamente!\n", filePath)
+			log.Printf("[🚨 INTEGRITÀ VIOLATA] Il file %s è stato modificato!\n", filePath)
 			encryptAndIsolateFile(filePath)
-			sendWebhookAlert("🚨 ALLERTA MANOMISSIONE FILE", fmt.Sprintf("Il file importante %s è stato modificato ed è stato spostato in quarantena cifrata AES-256.", filePath))
+			sendWebhookAlert("🚨 ALLERTA MANOMISSIONE FILE", fmt.Sprintf("Il file %s è stato spostato in quarantena.", filePath))
 			reportThreatToGateway("File Tampering & Encrypted Quarantine: " + filePath)
 			fileRegistry[filePath] = currentHash
 		}
@@ -161,12 +187,10 @@ func encryptAndIsolateFile(filePath string) {
 		_ = os.Remove(filePath)
 		return
 	}
-
 	block, err := aes.NewCipher(cryptoKey)
 	if err != nil {
 		return
 	}
-
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
 		return
@@ -175,15 +199,11 @@ func encryptAndIsolateFile(filePath string) {
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
 		return
 	}
-
 	ciphertext := gcm.Seal(nonce, nonce, plaintext, nil)
-
 	fileName := filepath.Base(filePath)
 	destination := filepath.Join(decodeString(hexQuarantineDir), fileName+".locked")
-	
 	_ = os.WriteFile(destination, ciphertext, 0644)
 	_ = os.Remove(filePath)
-	log.Printf("[🔒 CRYPTO-QUARANTENA] Il file %s è stato cifrato e neutralizzato.\n", fileName)
 }
 
 func sendWebhookAlert(title, message string) {
@@ -207,14 +227,12 @@ func checkSuspiciousProcesses() {
 	if err != nil {
 		return
 	}
-
 	outputStr := out.String()
 	maliciousTools := []string{"nmap", "wireshark", "hydra", "metasploit", "nc"}
-
 	for _, tool := range maliciousTools {
 		if strings.Contains(strings.ToLower(outputStr), tool) {
 			log.Printf("[🚨 MINACCIA RILEVATA] Trovato processo sospetto attivo: %s!\n", tool)
-			sendWebhookAlert("💀 PROCESSO MALIGNO RILEVATO", fmt.Sprintf("È stato trovato un tool di hacking attivo sul dispositivo: %s.", tool))
+			sendWebhookAlert("💀 PROCESSO MALIGNO RILEVATO", fmt.Sprintf("Trovato tool attivo: %s.", tool))
 			reportThreatToGateway("Suspicious Process: " + tool)
 		}
 	}
