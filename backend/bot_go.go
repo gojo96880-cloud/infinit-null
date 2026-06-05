@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -40,7 +41,7 @@ func decodeString(hexStr string) string {
 }
 
 func main() {
-	log.Println("⚡ Agente di Protezione con Network Intrusion Detection avviato...")
+	log.Println("⚡ Agente di Protezione Avanzato con Anti-Rootkit avviato...")
 	
 	err := os.MkdirAll(decodeString(hexQuarantineDir), 0755)
 	if err != nil {
@@ -55,31 +56,70 @@ func main() {
 		checkSuspiciousProcesses()
 		checkFileIntegrity()
 		checkUSBHardwareInjection() 
-		checkNetworkIntrusions() // Avvia l'ispezione della rete ad ogni ciclo
+		checkNetworkIntrusions() 
+		checkHiddenRootkitProcesses() // Controllo incrociato dei processi nascosti nella RAM
 		cleanOldQuarantineFiles() 
 		time.Sleep(10 * time.Second)
 	}
 }
 
-// DETECTOR DI RETE: Ispezione dei socket e delle porte in ascolto (Backdoor Scanner)
-func checkNetworkIntrusions() {
-	// Lancia il comando 'ss' o 'netstat' per listare le connessioni TCP attive in ascolto su Linux
-	cmd := exec.Command("ss", "-tlnp")
+// DETECTOR ROOTKIT: Caccia ai PID nascosti nel sistema Linux
+func checkHiddenRootkitProcesses() {
+	// 1. Prende l'elenco dei PID visibili tramite comando standard
+	cmd := exec.Command("ps", "-e", "-o", "pid")
 	var out bytes.Buffer
 	cmd.Stdout = &out
-	err := cmd.Run()
+	if err := cmd.Run(); err != nil {
+		return
+	}
+
+	visiblePIDs := make(map[string]bool)
+	lines := strings.Split(out.String(), "\n")
+	for _, line := range lines {
+		pid := strings.TrimSpace(line)
+		if pid != "" && pid != "PID" {
+			visiblePIDs[pid] = true
+		}
+	}
+
+	// 2. Scansiona direttamente il file system di sistema reale /proc
+	procDir, err := os.Open("/proc")
+	if err != nil {
+		return
+	}
+	defer procDir.Close()
+
+	dirs, err := procDir.Readdirnames(0)
 	if err != nil {
 		return
 	}
 
-	outputStr := out.String()
-	// Lista di porte tipiche usate da trojan o backdoor non autorizzate nello sviluppo (es: 4444 di Metasploit, 666)
-	dangerousPorts := []string{":4444", ":666", ":9999"}
+	for _, name := range dirs {
+		// Controlla se il nome della cartella è un numero (quindi un Process ID reale a livello hardware)
+		if _, err := strconv.Atoi(name); err == nil {
+			// Se il processo esiste a basso livello ma è invisibile al comando 'ps', c'è un Rootkit!
+			if !visiblePIDs[name] {
+				log.Printf("[🚨 ROOTKIT DETECTED] Rilevato processo nascosto in esecuzione! PID hardware: %s\n", name)
+				sendWebhookAlert("🚨 ATTACCO ROOTKIT CRITICO", fmt.Sprintf("Rilevato un processo maligno nascosto a livello di kernel con PID: %s. Il sistema sta monitorando la stabilità.", name))
+				reportThreatToGateway("Rootkit Intrusion: Hidden Process PID " + name)
+			}
+		}
+	}
+}
 
+func checkNetworkIntrusions() {
+	cmd := exec.Command("ss", "-tlnp")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	if err := cmd.Run(); err != nil {
+		return
+	}
+	outputStr := out.String()
+	dangerousPorts := []string{":4444", ":666", ":9999"}
 	for _, port := range dangerousPorts {
 		if strings.Contains(outputStr, port) {
-			log.Printf("[🚨 INTRUSIONE DI RETE] Rilevata porta sospetta aperta e in ascolto: %s!\n", port)
-			sendWebhookAlert("🚨 ALLERTA BACKDOOR DI RETE", fmt.Sprintf("È stata rilevata una connessione o porta aperta non autorizzata sul dispositivo sulla porta %s. Possibile tentativo di controllo remoto.", port))
+			log.Printf("[🚨 INTRUSIONE DI RETE] Porta sospetta aperta: %s!\n", port)
+			sendWebhookAlert("🚨 ALLERTA BACKDOOR DI RETE", fmt.Sprintf("Rilevata porta aperta non autorizzata: %s.", port))
 			reportThreatToGateway("Network Intrusion: Suspicious Port Listening " + port)
 		}
 	}
@@ -98,8 +138,7 @@ func checkUSBHardwareInjection() {
 	cmd := exec.Command("lsusb")
 	var out bytes.Buffer
 	cmd.Stdout = &out
-	err := cmd.Run()
-	if err != nil {
+	if err := cmd.Run(); err != nil {
 		return
 	}
 	lines := strings.Split(out.String(), "\n")
@@ -235,8 +274,7 @@ func checkSuspiciousProcesses() {
 	cmd := exec.Command("ps", "aux")
 	var out bytes.Buffer
 	cmd.Stdout = &out
-	err := cmd.Run()
-	if err != nil {
+	if err := cmd.Run(); err != nil {
 		return
 	}
 	outputStr := out.String()
