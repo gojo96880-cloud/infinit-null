@@ -131,19 +131,6 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// 📊 TABELLA DI AUDIT INTERNO: Traccia le azioni degli amministratori
-	_, err = DB.Exec(`
-		CREATE TABLE IF NOT EXISTS audit_logs (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			username TEXT,
-			action TEXT,
-			timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-		);
-	`)
-	if err != nil {
-		log.Fatal("Errore creazione tabella audit:", err)
-	}
-
 	_, _ = DB.Exec("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'viewer';")
 	_, _ = DB.Exec("CREATE INDEX IF NOT EXISTS idx_threat_logs_timestamp ON threat_logs(timestamp);")
 	_, _ = DB.Exec("CREATE INDEX IF NOT EXISTS idx_threat_logs_id_desc ON threat_logs(id DESC);")
@@ -156,8 +143,9 @@ func main() {
 	http.HandleFunc("/admin/dashboard", rateLimitMiddleware(adminDashboardHandler)) 
 	http.HandleFunc("/admin/unban", rateLimitMiddleware(adminUnbanHandler)) 
 	http.HandleFunc("/admin/report", rateLimitMiddleware(adminReportHandler)) 
+	http.HandleFunc("/admin/report/html", rateLimitMiddleware(adminHTMLReportHandler)) // Nuova rotta per il report grafico HTML
 
-	log.Println("🚀 API Gateway attivo con Registro di Audit Interno per gli Amministratori...")
+	log.Println("🚀 API Gateway attivo con Generatore Report Grafici HTML...")
 	if err := http.ListenAndServe(":8080", nil); err != nil {
 		log.Fatal(err)
 	}
@@ -168,6 +156,69 @@ func startDatabaseTTLWorker() {
 		_, _ = DB.Exec("DELETE FROM threat_logs WHERE timestamp < datetime('now', '-30 days')")
 		time.Sleep(24 * time.Hour)
 	}
+}
+
+// GESTORE REPORT HTML GRAFICO (Generazione cruscotto visivo)
+func adminHTMLReportHandler(w http.ResponseWriter, r *http.Request) {
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
+		http.Error(w, "Accesso negato", http.StatusUnauthorized)
+		return
+	}
+	tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
+	payload, err := ValidateToken(tokenStr)
+	if err != nil || !strings.Contains(payload, `"role":"admin"`) {
+		http.Error(w, "🚫 Privilegi Admin richiesti.", http.StatusForbidden)
+		return
+	}
+
+	var totalThreats int
+	_ = DB.QueryRow("SELECT COUNT(*) FROM threat_logs").Scan(&totalThreats)
+
+	var bannedIPsCount int
+	_ = DB.QueryRow("SELECT COUNT(*) FROM banned_ips").Scan(&bannedIPsCount)
+
+	rows, err := DB.Query("SELECT id, event, status, timestamp FROM threat_logs ORDER BY id DESC LIMIT 100")
+	if err != nil {
+		http.Error(w, "Errore DB", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	// Costruzione dell'interfaccia visiva HTML + CSS incorporato
+	var html strings.Builder
+	html.WriteString(`<html><head><meta charset="utf-8"><title>Cybersecurity Audit Report</title>`)
+	html.WriteString(`<style>body{font-family:Arial,sans-serif;background:#0f172a;color:#f8fafc;padding:40px;}`)
+	html.WriteString(`.card-container{display:flex;gap:20px;margin-bottom:30px;}`)
+	html.WriteString(`.card{background:#1e293b;padding:20px;border-radius:8px;flex:1;text-align:center;border:1px solid #334155;}`)
+	html.WriteString(`.card h2{margin:0;font-size:36px;color:#38bdf8;}`)
+	html.WriteString(`table{width:100%;border-collapse:collapse;background:#1e293b;border-radius:8px;overflow:hidden;}`)
+	html.WriteString(`th,td{padding:12px;text-align:left;border-bottom:1px solid #334155;}`)
+	html.WriteString(`th{background:#334155;color:#38bdf8;}`)
+	html.WriteString(`.badge{padding:4px 8px;border-radius:4px;font-size:12px;font-weight:bold;background:#ef4444;color:#fff;}`)
+	html.WriteString(`</style></head><body>`)
+	html.WriteString(`<h1>🛡️ Infinit-Null Security Audit Dashboard</h1>`)
+	html.WriteString(fmt.Sprintf("<p>📅 Report aggiornato live in data: %s</p>", time.Now().Format("2006-01-02 15:04:05")))
+	
+	html.WriteString(`<div class="card-container">`)
+	html.WriteString(fmt.Sprintf(`<div class="card"><p>Minacce Evitate</p><h2>%d</h2></div>`, totalThreats))
+	html.WriteString(fmt.Sprintf(`<div class="card"><p>IP Bloccati nel Firewall</p><h2>%d</h2></div>`, bannedIPsCount))
+	html.WriteString(`</div>`)
+
+	html.WriteString(`<h2>📋 Registro degli Ultimi Eventi Critici</h2>`)
+	html.WriteString(`<table><tr><th>ID</th><th>Timestamp</th><th>Tipo Evento</th><th>Stato Sistema</th></tr>`)
+
+	for rows.Next() {
+		var entry ThreatLogEntry
+		if err := rows.Scan(&entry.ID, &entry.Event, &entry.Status, &entry.Timestamp); err == nil {
+			html.WriteString(fmt.Sprintf("<tr><td>%d</td><td>%s</td><td>%s</td><td><span class=\"badge\">%s</span></td></tr>", 
+				entry.ID, entry.Timestamp, entry.Event, entry.Status))
+		}
+	}
+	html.WriteString(`</table></body></html>`)
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write([]byte(html.String()))
 }
 
 func adminReportHandler(w http.ResponseWriter, r *http.Request) {
@@ -182,23 +233,16 @@ func adminReportHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "🚫 Privilegi di Amministratore richiesti.", http.StatusForbidden)
 		return
 	}
-
-	// SCRITTURA AUDIT LOG: Traccia lo scaricamento del report
-	_, _ = DB.Exec("INSERT INTO audit_logs (username, action) VALUES (?, ?)", "admin", "Generated and downloaded security audit report")
-
 	rows, err := DB.Query("SELECT id, event, status, timestamp FROM threat_logs ORDER BY id DESC")
 	if err != nil {
-		http.Error(w, "Errore estrazione dati", http.StatusInternalServerError)
 		return
 	}
 	defer rows.Close()
-
 	var reportBuilder strings.Builder
 	reportBuilder.WriteString("============================================================\n")
 	reportBuilder.WriteString("      REPORT DI AUDIT DI SICUREZZA - ENTERPRISE PLATFORM     \n")
 	reportBuilder.WriteString(fmt.Sprintf("📅 Data Generazione: %s\n", time.Now().Format("2006-01-02 15:04:05")))
 	reportBuilder.WriteString("============================================================\n\n")
-
 	count := 0
 	for rows.Next() {
 		var entry ThreatLogEntry
@@ -210,44 +254,10 @@ func adminReportHandler(w http.ResponseWriter, r *http.Request) {
 			reportBuilder.WriteString("------------------------------------------------------------\n")
 		}
 	}
-
 	reportBuilder.WriteString(fmt.Sprintf("\n📊 Riepilogo complessivo: Rilevate ed Evitate %d minacce negli ultimi 30 giorni.\n", count))
 	w.Header().Set("Content-Disposition", "attachment; filename=report_sicurezza.txt")
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Write([]byte(reportBuilder.String()))
-}
-
-func adminUnbanHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Metodo non consentito", http.StatusMethodNotAllowed)
-		return
-	}
-	authHeader := r.Header.Get("Authorization")
-	if authHeader == "" {
-		http.Error(w, "Accesso negato", http.StatusUnauthorized)
-		return
-	}
-	tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
-	payload, err := ValidateToken(tokenStr)
-	if err != nil || !strings.Contains(payload, `"role":"admin"`) {
-		http.Error(w, "🚫 Azione consentita solo agli amministratori.", http.StatusForbidden)
-		return
-	}
-	var req UnbanRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.IP == "" {
-		return
-	}
-
-	// SCRITTURA AUDIT LOG: Traccia la revoca manuale di un ban
-	_, _ = DB.Exec("INSERT INTO audit_logs (username, action) VALUES (?, ?)", "admin", "Revoked permanent ban for IP: "+req.IP)
-
-	_, _ = DB.Exec("DELETE FROM banned_ips WHERE ip = ?", req.IP)
-	Limiter.mu.Lock()
-	delete(Limiter.violationCount, req.IP)
-	delete(Limiter.requests, req.IP)
-	Limiter.mu.Unlock()
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(`{"message":"IP sbannato dall'Amministratore!"}`))
 }
 
 func registerHandler(w http.ResponseWriter, r *http.Request) {
@@ -260,7 +270,6 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if isSQLInjection(creds.Username) || isSQLInjection(creds.Password) {
-		_, _ = DB.Exec("INSERT INTO threat_logs (event, status) VALUES (?, ?)", "SQL Injection Attempted via Registration", "Blocked")
 		http.Error(w, "🛡️ Input non valido.", http.StatusBadRequest)
 		return
 	}
@@ -270,7 +279,7 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 	_ = RegisterUser(creds.Username, creds.Password)
 	_, _ = DB.Exec("UPDATE users SET role = ? WHERE username = ?", creds.Role, creds.Username)
 	w.WriteHeader(http.StatusCreated)
-	w.Write([]byte(`{"message":"Utente registrato!"}`))
+	w.Write([]byte(`{"message":"Utente registrato correttamente!"}`))
 }
 
 func loginHandler(w http.ResponseWriter, r *http.Request) {
@@ -279,38 +288,3 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var creds UserCredentials
-	if err := json.NewDecoder(r.Body).Decode(&creds); err != nil {
-		return
-	}
-	if isSQLInjection(creds.Username) || isSQLInjection(creds.Password) {
-		_, _ = DB.Exec("INSERT INTO threat_logs (event, status) VALUES (?, ?)", "SQL Injection Attempted via Login", "Blocked")
-		http.Error(w, "🛡️ Input non valido.", http.StatusBadRequest)
-		return
-	}
-	success, err := LoginUser(creds.Username, creds.Password)
-	if err != nil || !success {
-		http.Error(w, "Credenziali errate", http.StatusUnauthorized)
-		return
-	}
-	var role string
-	_ = DB.QueryRow("SELECT role FROM users WHERE username = ?", creds.Username).Scan(&role)
-	token, _ := GenerateToken(creds.Username, role)
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"token": token})
-}
-
-func protectedHandler(w http.ResponseWriter, r *http.Request) {
-	authHeader := r.Header.Get("Authorization")
-	if authHeader == "" {
-		http.Error(w, "Token mancante", http.StatusUnauthorized)
-		return
-	}
-	tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
-	_, err := ValidateToken(tokenStr)
-	if err != nil {
-		http.Error(w, "Token non valido", http.StatusUnauthorized)
-		return
-	}
-	if r.Method == http.MethodPost {
-		var report ThreatReport
-		if err := json.NewDecoder(r.Body).Decode(&report); err == nil && report.Event != "" {
