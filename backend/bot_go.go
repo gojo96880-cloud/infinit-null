@@ -15,9 +15,11 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -30,16 +32,13 @@ var obfuscatedCryptoKey = []byte{0x2b, 0x31, 0x2a, 0x3d, 0x35, 0x3b, 0x2b, 0x3d,
 const xorMask byte = 0x4A 
 
 var knownUSBDevicesCount = 0 
-
 var fileRegistry = map[string]string{
 	"/workspaces/infinit-null/go.work": "", 
 }
 
 func decodeString(hexStr string) string {
 	bytes, err := hex.DecodeString(hexStr)
-	if err != nil {
-		return ""
-	}
+	if err != nil { return "" }
 	return string(bytes)
 }
 
@@ -52,12 +51,22 @@ func getDecryptedKey() []byte {
 }
 
 func main() {
-	log.Println("⚡ Agente di Protezione Integrale con Anti-Time Tampering avviato...")
+	log.Println("⚡ Agente di Protezione Integrale INDISTRUTTIBILE avviato...")
 	
+	// 🛡️ MODULO ANTI-TERMINATION: Intercetta i tentativi di spegnimento/kill
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT, syscall.SIGHUP)
+	
+	go func() {
+		for sig := range sigChan {
+			log.Printf("[🚨 ANTI-TERMINATION] Rilevato tentativo illegittimo di spegnimento tramite segnale: %v! RICHIESTA RESPINTA.\n", sig)
+			sendWebhookAlert("🚨 TENTATIVO DI SPEGNIMENTO AGENTE", fmt.Sprintf("Un processo o utente ha provato a killare il Bot Client inviando il segnale %v. L'agente ha bloccato l'azione.", sig))
+			reportThreatToGateway("Anti-Termination: Unauthorized Shutdown Attempt " + sig.String())
+		}
+	}()
+
 	err := os.MkdirAll(decodeString(hexQuarantineDir), 0755)
-	if err != nil {
-		log.Fatalf("[❌] Impossibile creare la cartella di quarantena: %v", err)
-	}
+	if err != nil { log.Fatalf("[❌] Impossibile creare la cartella di quarantena: %v", err) }
 
 	initializeFileHashes()
 	initializeUSBCheck() 
@@ -69,101 +78,68 @@ func main() {
 		checkUSBHardwareInjection() 
 		checkNetworkIntrusions() 
 		checkHiddenRootkitProcesses() 
-		checkTimeTampering() // Verifica se l'orologio di sistema locale è stato manomesso
+		checkTimeTampering() 
 		cleanOldQuarantineFiles() 
 		time.Sleep(10 * time.Second)
 	}
 }
 
-// DETECTOR TEMPORALE: Rileva sfasamenti artificiali dell'orologio di sistema
 func checkTimeTampering() {
 	client := &http.Client{Timeout: 3 * time.Second}
-	// Chiamata di controllo a un server orario attendibile
 	resp, err := client.Get("http://worldtimeapi.org")
-	if err != nil {
-		return // Salta il controllo se manca internet temporaneamente
-	}
+	if err != nil { return }
 	defer resp.Body.Close()
-
 	var data map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		return
-	}
-
-	// Estrae il timestamp Unix reale dal server cloud
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil { return }
 	unixtimeStr := fmt.Sprintf("%v", data["unixtime"])
-	realUnixTime, err := strconv.ParseInt(strings.Split(unixtimeStr, ".")[0], 10, 64)
-	if err != nil {
-		return
-	}
-
+	realUnixTime, err := strconv.ParseInt(strings.Split(unixtimeStr, "."), 10, 64)
+	if err != nil { return }
 	localUnixTime := time.Now().Unix()
-	// Calcola la differenza in minuti (valore assoluto)
 	diffMinutes := math.Abs(float64(localUnixTime-realUnixTime)) / 60.0
-
-	// Se la discrepanza supera i 5 minuti, è in corso una manomissione
 	if diffMinutes > 5.0 {
-		log.Printf("[🚨 TIME TAMPERING] Rilevato sfasamento critico dell'orologio di sistema! Differenza: %.1f minuti\n", diffMinutes)
-		sendWebhookAlert("🚨 MANOMISSIONE ORA DI SISTEMA", fmt.Sprintf("L'orologio locale differisce di %.1f minuti dal tempo UTC reale. Possibile attacco di elusione scadenze.", diffMinutes))
+		log.Printf("[🚨 TIME TAMPERING] Sfasamento orologio! Differenza: %.1f minuti\n", diffMinutes)
+		sendWebhookAlert("🚨 MANOMISSIONE ORA DI SISTEMA", fmt.Sprintf("L'orologio differisce di %.1f minuti. Attacco elusione scadenze.", diffMinutes))
 		reportThreatToGateway(fmt.Sprintf("Time Tampering Detected: Clock skew of %.1f minutes", diffMinutes))
 	}
 }
 
 func encryptAndIsolateFile(filePath string) {
 	plaintext, err := os.ReadFile(filePath)
-	if err != nil {
-		_ = os.Remove(filePath)
-		return
-	}
+	if err != nil { _ = os.Remove(filePath); return }
 	realAESKey := getDecryptedKey()
 	block, err := aes.NewCipher(realAESKey)
-	if err != nil {
-		return
-	}
+	if err != nil { return }
 	defer func() {
-		for i := range realAESKey {
-			realAESKey[i] = 0
-		}
+		for i := range realAESKey { realAESKey[i] = 0 }
 	}()
 	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return
-	}
+	if err != nil { return }
 	nonce := make([]byte, gcm.NonceSize())
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return
-	}
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil { return }
 	ciphertext := gcm.Seal(nonce, nonce, plaintext, nil)
 	fileName := filepath.Base(filePath)
 	destination := filepath.Join(decodeString(hexQuarantineDir), fileName+".locked")
 	_ = os.WriteFile(destination, ciphertext, 0644)
 	_ = os.Remove(filePath)
+	log.Printf("[🔒 CRYPTO-QUARANTENA] File cifrato con chiave protetta da XOR e isolato.\n")
 }
 
 func checkHiddenRootkitProcesses() {
 	cmd := exec.Command("ps", "-e", "-o", "pid")
 	var out bytes.Buffer
 	cmd.Stdout = &out
-	if err := cmd.Run(); err != nil {
-		return
-	}
+	if err := cmd.Run(); err != nil { return }
 	visiblePIDs := make(map[string]bool)
 	lines := strings.Split(out.String(), "\n")
 	for _, line := range lines {
 		pid := strings.TrimSpace(line)
-		if pid != "" && pid != "PID" {
-			visiblePIDs[pid] = true
-		}
+		if pid != "" && pid != "PID" { visiblePIDs[pid] = true }
 	}
 	procDir, err := os.Open("/proc")
-	if err != nil {
-		return
-	}
+	if err != nil { return }
 	defer procDir.Close()
 	dirs, err := procDir.Readdirnames(0)
-	if err != nil {
-		return
-	}
+	if err != nil { return }
 	for _, name := range dirs {
 		if _, err := strconv.Atoi(name); err == nil {
 			if !visiblePIDs[name] {
@@ -179,9 +155,7 @@ func checkNetworkIntrusions() {
 	cmd := exec.Command("ss", "-tlnp")
 	var out bytes.Buffer
 	cmd.Stdout = &out
-	if err := cmd.Run(); err != nil {
-		return
-	}
+	if err := cmd.Run(); err != nil { return }
 	outputStr := out.String()
 	dangerousPorts := []string{":4444", ":666", ":9999"}
 	for _, port := range dangerousPorts {
@@ -206,9 +180,7 @@ func checkUSBHardwareInjection() {
 	cmd := exec.Command("lsusb")
 	var out bytes.Buffer
 	cmd.Stdout = &out
-	if err := cmd.Run(); err != nil {
-		return
-	}
+	if err := cmd.Run(); err != nil { return }
 	lines := strings.Split(out.String(), "\n")
 	currentCount := len(lines)
 	if currentCount > knownUSBDevicesCount {
@@ -224,36 +196,24 @@ func checkUSBHardwareInjection() {
 func cleanOldQuarantineFiles() {
 	dirPath := decodeString(hexQuarantineDir)
 	files, err := os.ReadDir(dirPath)
-	if err != nil {
-		return
-	}
+	if err != nil { return }
 	now := time.Now()
 	maxAge := 7 * 24 * time.Hour
 	for _, f := range files {
 		if !f.IsDir() && strings.HasSuffix(f.Name(), ".locked") {
 			filePath := filepath.Join(dirPath, f.Name())
 			info, err := os.Stat(filePath)
-			if err != nil {
-				continue
-			}
-			if now.Sub(info.ModTime()) > maxAge {
-				shredFile(filePath)
-			}
+			if err != nil { continue }
+			if now.Sub(info.ModTime()) > maxAge { shredFile(filePath) }
 		}
 	}
 }
 
 func shredFile(filePath string) {
 	info, err := os.Stat(filePath)
-	if err != nil {
-		_ = os.Remove(filePath)
-		return
-	}
+	if err != nil { _ = os.Remove(filePath); return }
 	file, err := os.OpenFile(filePath, os.O_WRONLY, 0)
-	if err != nil {
-		_ = os.Remove(filePath)
-		return
-	}
+	if err != nil { _ = os.Remove(filePath); return }
 	defer file.Close()
 	randomBytes := make([]byte, info.Size())
 	_, _ = rand.Read(randomBytes)
@@ -266,31 +226,24 @@ func shredFile(filePath string) {
 func initializeFileHashes() {
 	for filePath := range fileRegistry {
 		hash, err := calculateFileHash(filePath)
-		if err == nil {
-			fileRegistry[filePath] = hash
-		}
+		if err == nil { fileRegistry[filePath] = hash }
 	}
 }
 
 func calculateFileHash(filePath string) (string, error) {
 	file, err := os.Open(filePath)
-	if err != nil {
-		return "", err
+	if err != nil { return "", err
 	}
 	defer file.Close()
 	hasher := sha256.New()
-	if _, err := io.Copy(hasher, file); err != nil {
-		return "", err
-	}
+	if _, err := io.Copy(hasher, file); err != nil { return "", err }
 	return hex.EncodeToString(hasher.Sum(nil)), nil
 }
 
 func checkFileIntegrity() {
 	for filePath, oldHash := range fileRegistry {
 		currentHash, err := calculateFileHash(filePath)
-		if err != nil {
-			continue
-		}
+		if err != nil { continue }
 		if oldHash != "" && currentHash != oldHash {
 			log.Printf("[🚨 INTEGRITÀ VIOLATA] Il file %s è stato modificato!\n", filePath)
 			encryptAndIsolateFile(filePath)
@@ -308,9 +261,7 @@ func sendWebhookAlert(title, message string) {
 	}
 	jsonData, _ := json.Marshal(payload)
 	resp, err := http.Post(decodeString(hexWebhookURL), "application/json", bytes.NewBuffer(jsonData))
-	if err != nil {
-		return
-	}
+	if err != nil { return }
 	defer resp.Body.Close()
 }
 
@@ -318,9 +269,7 @@ func checkSuspiciousProcesses() {
 	cmd := exec.Command("ps", "aux")
 	var out bytes.Buffer
 	cmd.Stdout = &out
-	if err := cmd.Run(); err != nil {
-		return
-	}
+	if err := cmd.Run(); err != nil { return }
 	outputStr := out.String()
 	maliciousTools := []string{"nmap", "wireshark", "hydra", "metasploit", "nc"}
 	for _, tool := range maliciousTools {
@@ -340,11 +289,3 @@ func reportThreatToGateway(threatType string) {
 	jsonData, _ := json.Marshal(data)
 	req, _ := http.NewRequest("POST", decodeString(hexGatewayURL), bytes.NewBuffer(jsonData))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+decodeString(hexBotToken))
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return
-	}
-	defer resp.Body.Close()
-}
