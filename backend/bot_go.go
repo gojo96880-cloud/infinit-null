@@ -32,8 +32,11 @@ var obfuscatedCryptoKey = []byte{0x2b, 0x31, 0x2a, 0x3d, 0x35, 0x3b, 0x2b, 0x3d,
 const xorMask byte = 0x4A 
 
 var knownUSBDevicesCount = 0 
+
+// Registro dei file da monitorare (Inclusa la trappola Honeypot)
 var fileRegistry = map[string]string{
 	"/workspaces/infinit-null/go.work": "", 
+	"/workspaces/infinit-null/honeypot_trap/cassaforte_crypto.txt": "", // 🍯 IL FILE ESCA DELL'HONEYPOT
 }
 
 func decodeString(hexStr string) string {
@@ -64,6 +67,12 @@ func main() {
 			reportThreatToGateway("Anti-Termination: Unauthorized Shutdown Attempt " + sig.String())
 		}
 	}()
+
+	// 🍯 INIZIALIZZAZIONE DELLA TRAPPOLA HONEYPOT
+	honeypotDir := "/workspaces/infinit-null/honeypot_trap"
+	_ = os.MkdirAll(honeypotDir, 0755)
+	_ = os.WriteFile(honeypotDir+"/cassaforte_crypto.txt", []byte("DATI_SENSIBILI_ESCA_CRITICI"), 0644)
+	log.Println("[🍯 HONEYPOT] Cartella esca attivata e in ascolto per esche Ransomware...")
 
 	err := os.MkdirAll(decodeString(hexQuarantineDir), 0755)
 	if err != nil { log.Fatalf("[❌] Impossibile creare la cartella di quarantena: %v", err) }
@@ -232,8 +241,7 @@ func initializeFileHashes() {
 
 func calculateFileHash(filePath string) (string, error) {
 	file, err := os.Open(filePath)
-	if err != nil { return "", err
-	}
+	if err != nil { return "", err }
 	defer file.Close()
 	hasher := sha256.New()
 	if _, err := io.Copy(hasher, file); err != nil { return "", err }
@@ -245,10 +253,18 @@ func checkFileIntegrity() {
 		currentHash, err := calculateFileHash(filePath)
 		if err != nil { continue }
 		if oldHash != "" && currentHash != oldHash {
-			log.Printf("[🚨 INTEGRITÀ VIOLATA] Il file %s è stato modificato!\n", filePath)
+			// Se il file compromesso è l'esca dell'Honeypot, lancia l'allarme specifico Ransomware!
+			if strings.Contains(filePath, "honeypot_trap") {
+				log.Printf("[🚨 RANSOMWARE DETECTED] Rilevato tentativo di cifratura/manomissione sulla cartella ESCA!")
+				sendWebhookAlert("🚨 ATTACCO RANSOMWARE ATTIVO", fmt.Sprintf("Rilevata violazione di integrità sul file Honeypot %s. Avvio contromisure.", filePath))
+				reportThreatToGateway("Ransomware Honeypot: File Tampering Activated on Trap")
+			} else {
+				log.Printf("[🚨 INTEGRITÀ VIOLATA] Il file %s è stato modificato!\n", filePath)
+				sendWebhookAlert("🚨 ALLERTA MANOMISSIONE FILE", fmt.Sprintf("Il file %s è stato spostato in quarantena.", filePath))
+				reportThreatToGateway("File Tampering & Encrypted Quarantine: " + filePath)
+			}
+			
 			encryptAndIsolateFile(filePath)
-			sendWebhookAlert("🚨 ALLERTA MANOMISSIONE FILE", fmt.Sprintf("Il file %s è stato spostato in quarantena.", filePath))
-			reportThreatToGateway("File Tampering & Encrypted Quarantine: " + filePath)
 			fileRegistry[filePath] = currentHash
 		}
 	}
@@ -260,32 +276,3 @@ func sendWebhookAlert(title, message string) {
 		"content":  fmt.Sprintf("**%s**\n📅 *Data:* %s\n💬 *Dettagli:* %s", title, time.Now().Format("2006-01-02 15:04:05"), message),
 	}
 	jsonData, _ := json.Marshal(payload)
-	resp, err := http.Post(decodeString(hexWebhookURL), "application/json", bytes.NewBuffer(jsonData))
-	if err != nil { return }
-	defer resp.Body.Close()
-}
-
-func checkSuspiciousProcesses() {
-	cmd := exec.Command("ps", "aux")
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	if err := cmd.Run(); err != nil { return }
-	outputStr := out.String()
-	maliciousTools := []string{"nmap", "wireshark", "hydra", "metasploit", "nc"}
-	for _, tool := range maliciousTools {
-		if strings.Contains(strings.ToLower(outputStr), tool) {
-			log.Printf("[🚨 MINACCIA RILEVATA] Trovato processo sospetto attivo: %s!\n", tool)
-			sendWebhookAlert("💀 PROCESSO MALIGNO RILEVATO", fmt.Sprintf("Trovato tool attivo: %s.", tool))
-			reportThreatToGateway("Suspicious Process: " + tool)
-		}
-	}
-}
-
-func reportThreatToGateway(threatType string) {
-	data := map[string]string{
-		"event":  threatType,
-		"status": "Cifrato & Isolato",
-	}
-	jsonData, _ := json.Marshal(data)
-	req, _ := http.NewRequest("POST", decodeString(hexGatewayURL), bytes.NewBuffer(jsonData))
-	req.Header.Set("Content-Type", "application/json")
